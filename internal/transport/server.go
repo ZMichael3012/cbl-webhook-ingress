@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"slices"
 	"strings"
 	"time"
@@ -198,10 +199,19 @@ func (s *Server) handleWebhook(c *gin.Context) {
 		GatewayID:     extractGatewayID(body),
 	})
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
+		// Исчерпание бюджета приходит двумя формами: ожидание блокировки и
+		// выполнение запроса дают context.DeadlineExceeded, а дедлайн на
+		// установлении соединения на Linux завершает dial через
+		// os.ErrDeadlineExceeded ("i/o timeout", проверено профилем 5.4:
+		// гонка с ctx.Err() не позволяет отличать его по состоянию контекста).
+		// В write-пути единственный внешний I/O - PostgreSQL, поэтому i/o
+		// таймаут здесь означает исчерпание бюджета; при появлении других
+		// сетевых вызовов внутри Handler классификацию потребуется уточнить.
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
 			s.log.Warn("webhook write budget exceeded",
 				zap.String("provider", provider),
 				zap.Duration("budget", s.writeTimeout),
+				zap.Error(err),
 			)
 			c.Header("Retry-After", "1")
 			ginmw.AbortWithProblem(c, http.StatusServiceUnavailable, "write_timeout", "Service Unavailable", "")

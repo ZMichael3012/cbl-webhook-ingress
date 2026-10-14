@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -461,6 +462,60 @@ func TestHandleWebhookWriteTimeout(t *testing.T) {
 	assert.Equal(t, "1", rec.Header().Get("Retry-After"))
 	assert.Contains(t, rec.Body.String(), "write_timeout")
 	assert.Equal(t, 1, handler.calls)
+}
+
+// dialTimeoutHandler имитирует исчерпание бюджета на установлении соединения
+// с PostgreSQL (Linux): dial завершается os.ErrDeadlineExceeded ("i/o timeout").
+type dialTimeoutHandler struct {
+	calls int
+}
+
+// Handle ждет дедлайна контекста и возвращает ошибку в форме pgx на Linux.
+func (h *dialTimeoutHandler) Handle(ctx context.Context, _ usecase.WebhookInput) (bool, error) {
+	h.calls++
+	<-ctx.Done()
+	return false, fmt.Errorf("usecase: save webhook: dial error: timeout: dial tcp: %w", os.ErrDeadlineExceeded)
+}
+
+func TestHandleWebhookWriteTimeoutOnDialError(t *testing.T) {
+	t.Parallel()
+
+	handler := &dialTimeoutHandler{}
+	router := newTestRouter(handler, transport.WithWriteTimeout(10*time.Millisecond))
+
+	req := signedRequest("{}", "vendor-1", fixedNow)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		router.ServeHTTP(rec, req)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("обработчик не завершился по бюджету записи")
+	}
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Equal(t, "1", rec.Header().Get("Retry-After"))
+	assert.Contains(t, rec.Body.String(), "write_timeout")
+	assert.Equal(t, 1, handler.calls)
+}
+
+func TestHandleWebhookIoTimeoutIsWriteTimeout(t *testing.T) {
+	t.Parallel()
+
+	// i/o таймаут в write-пути (единственный внешний I/O - PostgreSQL под
+	// бюджетом) классифицируется как исчерпание бюджета.
+	handler := &fakeHandler{err: fmt.Errorf("usecase: save webhook: dial error: %w", os.ErrDeadlineExceeded)}
+	router := newTestRouter(handler)
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, signedRequest("{}", "vendor-1", fixedNow))
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Equal(t, "1", rec.Header().Get("Retry-After"))
+	assert.Contains(t, rec.Body.String(), "write_timeout")
 }
 
 func TestParseProviders(t *testing.T) {

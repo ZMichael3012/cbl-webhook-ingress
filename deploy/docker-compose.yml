@@ -59,6 +59,19 @@ services:
       interval: 10s
       timeout: 5s
       retries: 20
+
+  kafka-init:
+    image: apache/kafka:3.7.0
+    depends_on:
+      kafka: { condition: service_healthy }
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for topic in gateway.webhooks.raw; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic "$$topic" --partitions 1 --replication-factor 1
+        done
+    networks: [cbl-net]
+
   webhook-ingress:
     profiles: ["app"]
     build:
@@ -78,6 +91,7 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       kafka: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
     networks: [cbl-net]
 
 volumes:

@@ -36,9 +36,12 @@ make build        # go build ./...
 make test         # go test ./...
 make vet          # go vet ./...
 make lint         # golangci-lint в Docker
-make up           # docker compose -f deploy/docker-compose.yml up -d
+make up           # docker compose -f deploy/docker-compose.yml --profile app up -d --build
 make down         # docker compose -f deploy/docker-compose.yml down -v
 ```
+
+Нагрузочный прогон k6 (5.4): команды и профили burst/degraded - в шапке
+`test/load/webhook_burst.js` (прогоняются на compose-стенде).
 
 ## 5. Порты и окружение
 
@@ -80,7 +83,7 @@ consumer lag; дашборды после задачи 0.7.
 | ID | Проблема | Влияние | План | Статус |
 | :-- | :-- | :-- | :-- | :-- |
 | KI-webhook-ingress-01 | CI и pre-commit не настроены | линтеры запускаются вручную | задача 0.2 | open |
-| KI-webhook-ingress-02 | Нагрузочный профиль (5.4) не написан | порог p99 менее 500 мс не подтвержден; поведение при деградации БД (retry-шторм 503, T-WH-04) не измерено | задача 5.4 (профиль всплеска и деградации БД) | open |
+| KI-webhook-ingress-02 | Нагрузочный профиль (5.4) не написан | порог p99 менее 500 мс не подтвержден; поведение при деградации БД (retry-шторм 503, T-WH-04) не измерено | ЗАКРЫТ 14.10.2026: `test/load/webhook_burst.js`, профили burst (p99 25.36 мс, 0 ошибок) и degraded (100% 503 + Retry-After, p99 459.7 мс); найден и исправлен дефект классификации `os.ErrDeadlineExceeded` | closed |
 | KI-webhook-ingress-03 | traceparent не пробрасывается в конверт события | сквозная трассировка асинхронного звена неполная | задача 0.7 | open |
 | KI-webhook-ingress-04 | За прокси/балансировщиком allowlist видит адрес прокси, а не шлюза; реальный адрес клиента не проверяется | защита ослаблена, если LB доступен извне | прямой прием в prod; при появлении LB - allowlist по адресам LB плюс сетевые ограничения (0.3) и ограничение доступа к шлюзу (0.6) | open |
 
@@ -90,7 +93,8 @@ consumer lag; дашборды после задачи 0.7.
 | :-- | :-- | :-- | :-- | :-- |
 | CBL-5.1 | 2026-10-14 | done, ревью закрыто (HMAC-эндпоинт, allowlist, e2e с Kafka, покрытие 84.5%) | `.specs/CBL-5.1-hmac-endpoint.md` | 73e1dbd |
 | CBL-5.2 | 2026-10-14 | done, ревью закрыто (конкурентная идемпотентность, бюджет записи 450 мс с 503, инварианты конверта) | `.specs/CBL-5.2-inbox-outbox.md` | f3d567a |
-| CBL-5.3 | 2026-10-14 | done, ревью закрыто (allowlist IP пира, лимит приема in-process, порядок проверок) | `.specs/CBL-5.3-protection.md` | этот коммит |
+| CBL-5.3 | 2026-10-14 | done, ревью закрыто (allowlist IP пира, лимит приема in-process, порядок проверок) | `.specs/CBL-5.3-protection.md` | 404c665 |
+| CBL-5.4 | 2026-10-14 | done, ревью закрыто (k6 профили burst/degraded, p99 30.66 мс; fix классификации os.ErrDeadlineExceeded; kafka-init на стенде) | `.specs/CBL-5.4-load.md` | этот коммит |
 
 ## 11. Runbook
 
