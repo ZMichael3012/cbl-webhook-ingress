@@ -71,6 +71,7 @@ services:
       KAFKA_BROKERS: kafka:29092
       WEBHOOK_PROVIDERS: '{"mock":{"signature_header":"X-Billing-Signature","event_id_header":"X-Event-Id","secret_env":"MOCK_WEBHOOK_SECRET"}}'
       MOCK_WEBHOOK_SECRET: mock-secret
+      WEBHOOK_WRITE_TIMEOUT: 450ms
     ports:
       - "8060:8060"
       - "9260:9260"

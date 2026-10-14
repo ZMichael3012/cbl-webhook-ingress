@@ -33,12 +33,13 @@ type Handler interface {
 
 // Server принимает вебхуки провайдеров.
 type Server struct {
-	providers map[string]domain.ProviderConfig
-	handler   Handler
-	clock     func() time.Time
-	window    time.Duration
-	maxBody   int64
-	log       *zap.Logger
+	providers    map[string]domain.ProviderConfig
+	handler      Handler
+	clock        func() time.Time
+	window       time.Duration
+	maxBody      int64
+	writeTimeout time.Duration
+	log          *zap.Logger
 }
 
 // Option настраивает Server.
@@ -71,18 +72,36 @@ func WithMaxBody(maxBody int64) Option {
 	}
 }
 
+// WithWriteTimeout задает бюджет записи события в PostgreSQL;
+// значение прижимается к допустимому диапазону домена.
+func WithWriteTimeout(timeout time.Duration) Option {
+	return func(s *Server) {
+		if timeout <= 0 {
+			return
+		}
+		if timeout < domain.MinWriteTimeout {
+			timeout = domain.MinWriteTimeout
+		}
+		if timeout > domain.MaxWriteTimeout {
+			timeout = domain.MaxWriteTimeout
+		}
+		s.writeTimeout = timeout
+	}
+}
+
 // NewServer создает Server приема вебхуков.
 func NewServer(providers map[string]domain.ProviderConfig, handler Handler, log *zap.Logger, opts ...Option) *Server {
 	if log == nil {
 		log = zap.NewNop()
 	}
 	s := &Server{
-		providers: providers,
-		handler:   handler,
-		clock:     time.Now,
-		window:    hmac.DefaultWindow,
-		maxBody:   MaxBodyBytes,
-		log:       log,
+		providers:    providers,
+		handler:      handler,
+		clock:        time.Now,
+		window:       hmac.DefaultWindow,
+		maxBody:      MaxBodyBytes,
+		writeTimeout: domain.DefaultWriteTimeout,
+		log:          log,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -140,15 +159,35 @@ func (s *Server) handleWebhook(c *gin.Context) {
 		return
 	}
 
-	processed, err := s.handler.Handle(c.Request.Context(), usecase.WebhookInput{
+	// Бюджет записи защищает ответ от деградации PostgreSQL: прерванная
+	// транзакция откатывается, провайдер повторит доставку, дублей не будет.
+	writeCtx, cancel := context.WithTimeout(c.Request.Context(), s.writeTimeout)
+	defer cancel()
+	processed, err := s.handler.Handle(writeCtx, usecase.WebhookInput{
 		Provider:      provider,
 		EndpointID:    endpointID,
 		VendorEventID: vendorEventID,
-		Headers:       flattenHeaders(c.Request.Header),
+		Headers:       flattenHeaders(c.Request.Header, config.SignatureHeader),
 		RawBody:       body,
 		GatewayID:     extractGatewayID(body),
 	})
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			s.log.Warn("webhook write budget exceeded",
+				zap.String("provider", provider),
+				zap.Duration("budget", s.writeTimeout),
+			)
+			c.Header("Retry-After", "1")
+			ginmw.AbortWithProblem(c, http.StatusServiceUnavailable, "write_timeout", "Service Unavailable", "")
+			return
+		}
+		if errors.Is(err, context.Canceled) {
+			// Клиент отменил запрос: ответ не важен, Error здесь создал бы
+			// ложный шум в метрике доли ошибок (0.7).
+			s.log.Info("webhook handling canceled by client", zap.String("provider", provider))
+			ginmw.AbortWithProblem(c, http.StatusRequestTimeout, "request_canceled", "Request Timeout", "")
+			return
+		}
 		s.log.Error("webhook handling failed", zap.String("provider", provider), zap.Error(err))
 		ginmw.AbortWithProblem(c, http.StatusInternalServerError, "internal_error", "Internal Server Error", "")
 		return
@@ -166,14 +205,18 @@ var sensitiveHeaders = map[string]struct{}{
 }
 
 // flattenHeaders приводит заголовки запроса к карте первых значений,
-// исключая потенциально чувствительные заголовки.
-func flattenHeaders(header http.Header) map[string]string {
+// исключая потенциально чувствительные заголовки и заголовок подписи:
+// имя заголовка подписи настраивается и задается отдельно.
+func flattenHeaders(header http.Header, signatureHeader string) map[string]string {
 	headers := make(map[string]string, len(header))
 	for key, values := range header {
 		if len(values) == 0 {
 			continue
 		}
 		if _, sensitive := sensitiveHeaders[strings.ToLower(key)]; sensitive {
+			continue
+		}
+		if strings.EqualFold(key, signatureHeader) {
 			continue
 		}
 		headers[key] = values[0]

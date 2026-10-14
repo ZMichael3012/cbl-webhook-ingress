@@ -4,12 +4,16 @@ package transport_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -25,6 +29,7 @@ import (
 	"github.com/cbl/cbl-kit/outbox"
 	"github.com/cbl/cbl-kit/storagex"
 
+	"github.com/cbl/cbl-webhook-ingress/internal/transport"
 	"github.com/cbl/cbl-webhook-ingress/internal/usecase"
 )
 
@@ -77,6 +82,19 @@ func TestIntegrationWebhookSavedAndDeduplicated(t *testing.T) {
 	require.NoError(t, row.Scan(&payload, &key, &topic))
 	assert.Equal(t, "gateway.webhooks.raw", topic)
 	assert.Equal(t, "mock:g-1", key)
+
+	var headerJSON []byte
+	require.NoError(t, db.Raw("SELECT headers FROM outbox LIMIT 1").Row().Scan(&headerJSON))
+	var headers map[string]string
+	require.NoError(t, json.Unmarshal(headerJSON, &headers))
+	assert.Equal(t, "gateway.webhook.raw", headers[outbox.HeaderEventType])
+	assert.Equal(t, "v1", headers[outbox.HeaderSchemaVersion])
+	assert.Equal(t, "cbl-webhook-ingress", headers[outbox.HeaderProducer])
+	assert.Equal(t, "mock", headers["provider"])
+	assert.Equal(t, "vendor-1", headers["vendor_event_id"])
+	assert.Equal(t, "ep1", headers["endpoint_id"])
+	expectedEventID := uuid.NewSHA1(uuid.NameSpaceURL, []byte("cbl-webhook:mock:vendor-1")).String()
+	assert.Equal(t, expectedEventID, headers[outbox.HeaderEventID])
 
 	var raw eventsv1.GatewayWebhookRaw
 	require.NoError(t, proto.Unmarshal(payload, &raw))
@@ -131,6 +149,49 @@ func TestIntegrationRelayPublishesWebhook(t *testing.T) {
 	assert.Equal(t, int64(1), publishedRows)
 }
 
+func TestIntegrationWriteTimeoutRollsBackAndRetries(t *testing.T) {
+	db := setupWebhookDB(t)
+	realHandler := usecase.NewHandler(db, "cbl-webhook-ingress", zap.NewNop())
+	router := newTestRouter(realHandler, transport.WithWriteTimeout(150*time.Millisecond))
+
+	// Блокировка таблицы inbox воспроизводит медленную запись: транзакция
+	// обработчика зависает на вставке и прерывается бюджетом.
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	conn, err := sqlDB.Conn(context.Background())
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	lockTx, err := conn.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	defer func() { _ = lockTx.Rollback() }()
+	_, err = lockTx.ExecContext(context.Background(), "LOCK TABLE inbox IN ACCESS EXCLUSIVE MODE")
+	require.NoError(t, err)
+
+	body := `{"gateway_id":"g-timeout"}`
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, signedRequest(body, "vendor-timeout", fixedNow))
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Equal(t, "1", rec.Header().Get("Retry-After"))
+	assert.Contains(t, rec.Body.String(), "write_timeout")
+
+	require.NoError(t, lockTx.Rollback())
+
+	var count int64
+	require.NoError(t, db.Table("outbox").Count(&count).Error)
+	assert.Equal(t, int64(0), count, "прерванная транзакция не оставляет outbox-строк")
+	require.NoError(t, db.Table("inbox").Count(&count).Error)
+	assert.Equal(t, int64(0), count, "прерванная транзакция не оставляет inbox-строк")
+
+	retry := httptest.NewRecorder()
+	router.ServeHTTP(retry, signedRequest(body, "vendor-timeout", fixedNow))
+	require.Equal(t, http.StatusOK, retry.Code, "повтор после снятия блокировки")
+	assert.Contains(t, retry.Body.String(), `"duplicate":false`)
+	require.NoError(t, db.Table("outbox").Count(&count).Error)
+	assert.Equal(t, int64(1), count)
+	require.NoError(t, db.Table("inbox").Count(&count).Error)
+	assert.Equal(t, int64(1), count)
+}
+
 func TestIntegrationWebhookPartitionKeyFallback(t *testing.T) {
 	db := setupWebhookDB(t)
 	realHandler := usecase.NewHandler(db, "cbl-webhook-ingress", zap.NewNop())
@@ -143,4 +204,45 @@ func TestIntegrationWebhookPartitionKeyFallback(t *testing.T) {
 	var key string
 	require.NoError(t, db.Raw("SELECT key FROM outbox LIMIT 1").Row().Scan(&key))
 	assert.Equal(t, "mock:ep1", key)
+}
+
+func TestIntegrationConcurrentDuplicates(t *testing.T) {
+	db := setupWebhookDB(t)
+	realHandler := usecase.NewHandler(db, "cbl-webhook-ingress", zap.NewNop())
+	router := newTestRouter(realHandler)
+
+	const workers = 8
+	body := `{"gateway_id":"g-conc"}`
+	start := make(chan struct{})
+	codes := make([]int, workers)
+	accepted := make([]bool, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			<-start
+			router.ServeHTTP(rec, signedRequest(body, "vendor-conc", fixedNow))
+			codes[index] = rec.Code
+			accepted[index] = strings.Contains(rec.Body.String(), `"duplicate":false`)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	fresh := 0
+	for i := 0; i < workers; i++ {
+		require.Equal(t, http.StatusOK, codes[i], "worker %d", i)
+		if accepted[i] {
+			fresh++
+		}
+	}
+	assert.Equal(t, 1, fresh, "ровно один конкурентный запрос создает событие")
+
+	var outboxCount, inboxCount int64
+	require.NoError(t, db.Table("outbox").Count(&outboxCount).Error)
+	require.NoError(t, db.Table("inbox").Count(&inboxCount).Error)
+	assert.Equal(t, int64(1), outboxCount)
+	assert.Equal(t, int64(1), inboxCount)
 }

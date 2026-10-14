@@ -3,6 +3,7 @@ package transport_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -87,6 +88,9 @@ func TestHandleWebhookSuccess(t *testing.T) {
 	assert.Equal(t, "vendor-1", handler.lastInput.VendorEventID)
 	assert.Equal(t, "g-1", handler.lastInput.GatewayID)
 	assert.Equal(t, body, string(handler.lastInput.RawBody))
+	for key := range handler.lastInput.Headers {
+		assert.Falsef(t, strings.EqualFold(key, "X-Signature"), "заголовок подписи %s не должен сохраняться", key)
+	}
 }
 
 func TestHandleWebhookDuplicate(t *testing.T) {
@@ -244,6 +248,45 @@ func TestHandleWebhookHandlerError(t *testing.T) {
 
 	require.Equal(t, http.StatusInternalServerError, rec.Code)
 	assert.Contains(t, rec.Body.String(), "internal_error")
+}
+
+// blockingHandler имитирует медленную запись в PostgreSQL, которая
+// не укладывается в бюджет ответа.
+type blockingHandler struct {
+	calls int
+}
+
+// Handle ждет дедлайна контекста и возвращает обернутую ошибку, как это
+// делает usecase-обвязка поверх прерванной транзакции.
+func (h *blockingHandler) Handle(ctx context.Context, _ usecase.WebhookInput) (bool, error) {
+	h.calls++
+	<-ctx.Done()
+	return false, fmt.Errorf("usecase: save webhook: %w", ctx.Err())
+}
+
+func TestHandleWebhookWriteTimeout(t *testing.T) {
+	t.Parallel()
+
+	handler := &blockingHandler{}
+	router := newTestRouter(handler, transport.WithWriteTimeout(10*time.Millisecond))
+
+	req := signedRequest("{}", "vendor-1", fixedNow)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		router.ServeHTTP(rec, req)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("обработчик не завершился по бюджету записи")
+	}
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Equal(t, "1", rec.Header().Get("Retry-After"))
+	assert.Contains(t, rec.Body.String(), "write_timeout")
+	assert.Equal(t, 1, handler.calls)
 }
 
 func TestParseProviders(t *testing.T) {

@@ -53,6 +53,11 @@ func main() {
 		log.Error("parse WEBHOOK_PROVIDERS failed", zap.Error(err))
 		return
 	}
+	writeTimeout, err := domain.ParseWriteTimeout(os.Getenv("WEBHOOK_WRITE_TIMEOUT"))
+	if err != nil {
+		log.Error("parse WEBHOOK_WRITE_TIMEOUT failed", zap.Error(err))
+		return
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -81,7 +86,7 @@ func main() {
 	}
 
 	handler := usecase.NewHandler(db, "cbl-webhook-ingress", log)
-	server := transport.NewServer(providers, handler, log)
+	server := transport.NewServer(providers, handler, log, transport.WithWriteTimeout(writeTimeout))
 
 	httpAddr := getenv("HTTP_ADDR", ":8060")
 	metricsAddr := getenv("METRICS_ADDR", ":9260")
