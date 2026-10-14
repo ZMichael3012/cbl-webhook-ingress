@@ -53,6 +53,10 @@ func main() {
 		log.Error("parse WEBHOOK_PROVIDERS failed", zap.Error(err))
 		return
 	}
+	for _, name := range domain.MissingAllowlist(providers) {
+		log.Warn("provider ip allowlist is empty: any source address is accepted",
+			zap.String("provider", name))
+	}
 	writeTimeout, err := domain.ParseWriteTimeout(os.Getenv("WEBHOOK_WRITE_TIMEOUT"))
 	if err != nil {
 		log.Error("parse WEBHOOK_WRITE_TIMEOUT failed", zap.Error(err))
@@ -92,6 +96,10 @@ func main() {
 	metricsAddr := getenv("METRICS_ADDR", ":9260")
 
 	router := gin.New()
+	if err := router.SetTrustedProxies(nil); err != nil {
+		log.Error("configure trusted proxies failed", zap.Error(err))
+		return
+	}
 	router.Use(ginmw.RequestID())
 	router.Use(ginmw.AccessLog(log))
 	router.Use(ginmw.Recovery(log))

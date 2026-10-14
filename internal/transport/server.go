@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"slices"
 	"strings"
 	"time"
@@ -34,6 +36,7 @@ type Handler interface {
 // Server принимает вебхуки провайдеров.
 type Server struct {
 	providers    map[string]domain.ProviderConfig
+	limiters     map[string]*domain.Limiter
 	handler      Handler
 	clock        func() time.Time
 	window       time.Duration
@@ -96,12 +99,16 @@ func NewServer(providers map[string]domain.ProviderConfig, handler Handler, log 
 	}
 	s := &Server{
 		providers:    providers,
+		limiters:     make(map[string]*domain.Limiter, len(providers)),
 		handler:      handler,
 		clock:        time.Now,
 		window:       hmac.DefaultWindow,
 		maxBody:      MaxBodyBytes,
 		writeTimeout: domain.DefaultWriteTimeout,
 		log:          log,
+	}
+	for name, config := range providers {
+		s.limiters[name] = domain.NewLimiter(config.RateRPS, config.RateBurst)
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -122,9 +129,28 @@ func (s *Server) handleWebhook(c *gin.Context) {
 		ginmw.AbortWithProblem(c, http.StatusNotFound, "provider_not_found", "Not Found", "провайдер не настроен")
 		return
 	}
+	// Сетевые проверки дешевле чтения тела и не раскрывают существование
+	// endpoint_id: чужой адрес отклоняется до всех остальных проверок.
+	if len(config.Allowlist) > 0 {
+		addr, ok := remoteIP(c.Request.RemoteAddr)
+		if !ok || !config.AllowsIP(addr) {
+			s.log.Warn("webhook source rejected",
+				zap.String("provider", provider),
+				zap.String("remote_addr", c.Request.RemoteAddr),
+			)
+			ginmw.AbortWithProblem(c, http.StatusForbidden, "ip_forbidden", "Forbidden", "")
+			return
+		}
+	}
 	endpointID := c.Param("endpoint_id")
 	if len(config.Endpoints) > 0 && !slices.Contains(config.Endpoints, endpointID) {
 		ginmw.AbortWithProblem(c, http.StatusNotFound, "endpoint_not_found", "Not Found", "эндпоинт не зарегистрирован")
+		return
+	}
+	if limiter := s.limiters[provider]; limiter != nil && !limiter.Allow(s.clock()) {
+		s.log.Warn("webhook rate limited", zap.String("provider", provider))
+		c.Header("Retry-After", "1")
+		ginmw.AbortWithProblem(c, http.StatusTooManyRequests, "rate_limited", "Too Many Requests", "")
 		return
 	}
 
@@ -193,6 +219,20 @@ func (s *Server) handleWebhook(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "accepted", "duplicate": !processed})
+}
+
+// remoteIP извлекает адрес TCP-пира запроса; proxy-заголовки не читаются,
+// чтобы подделка X-Forwarded-For не обходила allowlist.
+func remoteIP(remoteAddr string) (netip.Addr, bool) {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(remoteAddr))
+	if err != nil {
+		host = strings.TrimSpace(remoteAddr)
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return addr.Unmap(), true
 }
 
 // sensitiveHeaders задает заголовки, которые не попадают в событие и хранилища.

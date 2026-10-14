@@ -69,7 +69,7 @@ services:
       METRICS_ADDR: ":9260"
       PG_DSN: postgres://cbl:cbl@postgres:5432/webhook_ingress?sslmode=disable
       KAFKA_BROKERS: kafka:29092
-      WEBHOOK_PROVIDERS: '{"mock":{"signature_header":"X-Billing-Signature","event_id_header":"X-Event-Id","secret_env":"MOCK_WEBHOOK_SECRET"}}'
+      WEBHOOK_PROVIDERS: '{"mock":{"signature_header":"X-Billing-Signature","event_id_header":"X-Event-Id","secret_env":"MOCK_WEBHOOK_SECRET","rate_rps":1000,"rate_burst":2000}}'
       MOCK_WEBHOOK_SECRET: mock-secret
       WEBHOOK_WRITE_TIMEOUT: 450ms
     ports:

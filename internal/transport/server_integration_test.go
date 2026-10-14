@@ -29,6 +29,7 @@ import (
 	"github.com/cbl/cbl-kit/outbox"
 	"github.com/cbl/cbl-kit/storagex"
 
+	"github.com/cbl/cbl-webhook-ingress/internal/domain"
 	"github.com/cbl/cbl-webhook-ingress/internal/transport"
 	"github.com/cbl/cbl-webhook-ingress/internal/usecase"
 )
@@ -190,6 +191,33 @@ func TestIntegrationWriteTimeoutRollsBackAndRetries(t *testing.T) {
 	assert.Equal(t, int64(1), count)
 	require.NoError(t, db.Table("inbox").Count(&count).Error)
 	assert.Equal(t, int64(1), count)
+}
+
+func TestIntegrationAllowlistActive(t *testing.T) {
+	db := setupWebhookDB(t)
+	realHandler := usecase.NewHandler(db, "cbl-webhook-ingress", zap.NewNop())
+
+	providers, err := domain.ParseProviders(
+		`{"mock":{"signature_header":"X-Signature","event_id_header":"X-Event-Id","secret_env":"MOCK_SECRET","ip_allowlist":["192.0.2.0/24"]}}`,
+		func(key string) string {
+			if key == "MOCK_SECRET" {
+				return testSecret
+			}
+			return ""
+		},
+	)
+	require.NoError(t, err)
+	router := newTestRouterWithProviders(providers, realHandler)
+
+	// Адрес по умолчанию httptest (192.0.2.1) входит в allowlist.
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, signedRequest(`{"gateway_id":"g-al"}`, "vendor-al", fixedNow))
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"duplicate":false`)
+
+	var outboxCount int64
+	require.NoError(t, db.Table("outbox").Count(&outboxCount).Error)
+	assert.Equal(t, int64(1), outboxCount)
 }
 
 func TestIntegrationWebhookPartitionKeyFallback(t *testing.T) {

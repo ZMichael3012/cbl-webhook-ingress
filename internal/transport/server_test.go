@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -52,6 +53,11 @@ func newTestRouter(handler transport.Handler, opts ...transport.Option) *gin.Eng
 			Secret:          []byte(testSecret),
 		},
 	}
+	return newTestRouterWithProviders(providers, handler, opts...)
+}
+
+func newTestRouterWithProviders(providers map[string]domain.ProviderConfig, handler transport.Handler, opts ...transport.Option) *gin.Engine {
+	gin.SetMode(gin.TestMode)
 	options := append([]transport.Option{transport.WithClock(func() time.Time { return fixedNow })}, opts...)
 	server := transport.NewServer(providers, handler, zap.NewNop(), options...)
 	router := gin.New()
@@ -209,6 +215,174 @@ func TestHandleWebhookBadSignature(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, rec.Code)
 	assert.Contains(t, rec.Body.String(), "invalid_signature")
 	assert.Equal(t, 0, handler.calls)
+}
+
+func allowlistProviders(t *testing.T) map[string]domain.ProviderConfig {
+	t.Helper()
+	providers, err := domain.ParseProviders(
+		`{"mock":{"signature_header":"X-Signature","event_id_header":"X-Event-Id","secret_env":"MOCK_SECRET","ip_allowlist":["203.0.113.0/24","2001:db8::/32","192.0.2.7"]}}`,
+		func(key string) string {
+			if key == "MOCK_SECRET" {
+				return testSecret
+			}
+			return ""
+		},
+	)
+	require.NoError(t, err)
+	return providers
+}
+
+func requestFrom(remoteAddr, body, eventID string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/hooks/mock/ep1", strings.NewReader(body))
+	req.RemoteAddr = remoteAddr
+	req.Header.Set("X-Event-Id", eventID)
+	req.Header.Set("X-Signature", hmac.BuildHeader(hmac.Signature{
+		Timestamp: fixedNow,
+		Hex:       hmac.Sign([]byte(testSecret), fixedNow, []byte(body)),
+	}))
+	return req
+}
+
+func TestHandleWebhookIPAllowlist(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		remoteAddr string
+		wantCode   int
+	}{
+		"allowed subnet":   {remoteAddr: "203.0.113.7:41234", wantCode: http.StatusOK},
+		"allowed no port":  {remoteAddr: "203.0.113.7", wantCode: http.StatusOK},
+		"allowed single":   {remoteAddr: "192.0.2.7:41234", wantCode: http.StatusOK},
+		"allowed ipv6":     {remoteAddr: "[2001:db8::1]:41234", wantCode: http.StatusOK},
+		"denied ipv4":      {remoteAddr: "198.51.100.9:41234", wantCode: http.StatusForbidden},
+		"denied ipv6":      {remoteAddr: "[2001:db9::1]:41234", wantCode: http.StatusForbidden},
+		"denied ipv6 zone": {remoteAddr: "[fe80::1%eth0]:41234", wantCode: http.StatusForbidden},
+		"garbage peer":     {remoteAddr: "not-an-address", wantCode: http.StatusForbidden},
+		"empty peer":       {remoteAddr: "", wantCode: http.StatusForbidden},
+		"ipv4 mapped":      {remoteAddr: "[::ffff:203.0.113.7]:41234", wantCode: http.StatusOK},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			handler := &fakeHandler{processed: true}
+			router := newTestRouterWithProviders(allowlistProviders(t), handler)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, requestFrom(tc.remoteAddr, "{}", "vendor-1"))
+			require.Equal(t, tc.wantCode, rec.Code)
+			if tc.wantCode != http.StatusOK {
+				assert.Contains(t, rec.Body.String(), "ip_forbidden")
+				assert.Equal(t, 0, handler.calls)
+			}
+		})
+	}
+}
+
+func TestHandleWebhookIPAllowlistIgnoresForwardedHeaders(t *testing.T) {
+	t.Parallel()
+
+	handler := &fakeHandler{processed: true}
+	router := newTestRouterWithProviders(allowlistProviders(t), handler)
+
+	req := requestFrom("198.51.100.9:41234", "{}", "vendor-1")
+	req.Header.Set("X-Forwarded-For", "203.0.113.7")
+	req.Header.Set("X-Real-IP", "203.0.113.7")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Equal(t, 0, handler.calls)
+}
+
+func TestHandleWebhookIPAllowlistBeforeBodyAndSignature(t *testing.T) {
+	t.Parallel()
+
+	handler := &fakeHandler{processed: true}
+	router := newTestRouterWithProviders(allowlistProviders(t), handler, transport.WithMaxBody(16))
+
+	// Тело сверх лимита и отсутствующая подпись: если бы тело читалось или
+	// подпись проверялась до allowlist, ответ был бы 413 или 401.
+	req := httptest.NewRequest(http.MethodPost, "/hooks/mock/ep1", strings.NewReader(strings.Repeat("a", 100)))
+	req.RemoteAddr = "198.51.100.9:41234"
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Contains(t, rec.Body.String(), "ip_forbidden")
+	assert.Equal(t, 0, handler.calls)
+}
+
+func TestHandleWebhookRateLimited(t *testing.T) {
+	t.Parallel()
+
+	providers, err := domain.ParseProviders(
+		`{"mock":{"signature_header":"X-Signature","event_id_header":"X-Event-Id","secret_env":"MOCK_SECRET","rate_rps":1,"rate_burst":1}}`,
+		func(key string) string {
+			if key == "MOCK_SECRET" {
+				return testSecret
+			}
+			return ""
+		},
+	)
+	require.NoError(t, err)
+
+	handler := &fakeHandler{processed: true}
+	router := newTestRouterWithProviders(providers, handler)
+
+	first := httptest.NewRecorder()
+	router.ServeHTTP(first, requestFrom("203.0.113.7:1", "{}", "vendor-1"))
+	require.Equal(t, http.StatusOK, first.Code)
+
+	// Тело сверх лимита и отсутствующая подпись: лимит проверяется раньше.
+	second := httptest.NewRequest(http.MethodPost, "/hooks/mock/ep1", strings.NewReader(strings.Repeat("a", 1024)))
+	second.RemoteAddr = "203.0.113.7:1"
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, second)
+	require.Equal(t, http.StatusTooManyRequests, rec.Code)
+	assert.Equal(t, "1", rec.Header().Get("Retry-After"))
+	assert.Contains(t, rec.Body.String(), "rate_limited")
+	assert.Equal(t, 1, handler.calls, "отклоненный запрос не доходит до записи")
+}
+
+func TestHandleWebhookRateLimitRefill(t *testing.T) {
+	t.Parallel()
+
+	providers, err := domain.ParseProviders(
+		`{"mock":{"signature_header":"X-Signature","event_id_header":"X-Event-Id","secret_env":"MOCK_SECRET","rate_rps":10,"rate_burst":1}}`,
+		func(key string) string {
+			if key == "MOCK_SECRET" {
+				return testSecret
+			}
+			return ""
+		},
+	)
+	require.NoError(t, err)
+
+	var (
+		mu  sync.Mutex
+		now = fixedNow
+	)
+	clock := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}
+	handler := &fakeHandler{processed: true}
+	router := newTestRouterWithProviders(providers, handler, transport.WithClock(clock))
+
+	first := httptest.NewRecorder()
+	router.ServeHTTP(first, requestFrom("203.0.113.7:1", "{}", "vendor-1"))
+	require.Equal(t, http.StatusOK, first.Code)
+
+	second := httptest.NewRecorder()
+	router.ServeHTTP(second, requestFrom("203.0.113.7:1", "{}", "vendor-2"))
+	require.Equal(t, http.StatusTooManyRequests, second.Code)
+
+	mu.Lock()
+	now = now.Add(100 * time.Millisecond)
+	mu.Unlock()
+
+	third := httptest.NewRecorder()
+	router.ServeHTTP(third, requestFrom("203.0.113.7:1", "{}", "vendor-3"))
+	require.Equal(t, http.StatusOK, third.Code, "токен восстанавливается по времени")
 }
 
 func TestHandleWebhookExpiredSignature(t *testing.T) {
