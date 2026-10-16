@@ -28,13 +28,13 @@ func TestLimiterBurstAndRefill(t *testing.T) {
 
 	limiter := domain.NewLimiter(10, 3)
 	for i := 0; i < 3; i++ {
-		assert.Truef(t, limiter.Allow(limiterNow), "токен %d в пределах всплеска", i)
+		assert.Truef(t, limiter.Allow(limiterNow), "token %d is within the burst", i)
 	}
-	assert.False(t, limiter.Allow(limiterNow), "всплеск исчерпан")
+	assert.False(t, limiter.Allow(limiterNow), "burst is exhausted")
 
-	assert.False(t, limiter.Allow(limiterNow.Add(50*time.Millisecond)), "половина токена не принимается")
-	assert.True(t, limiter.Allow(limiterNow.Add(100*time.Millisecond)), "токен восстановлен")
-	assert.False(t, limiter.Allow(limiterNow.Add(100*time.Millisecond)), "токен израсходован")
+	assert.False(t, limiter.Allow(limiterNow.Add(50*time.Millisecond)), "half a token is not accepted")
+	assert.True(t, limiter.Allow(limiterNow.Add(100*time.Millisecond)), "token is refilled")
+	assert.False(t, limiter.Allow(limiterNow.Add(100*time.Millisecond)), "token is consumed")
 }
 
 func TestLimiterBurstDefaultsToRate(t *testing.T) {
@@ -57,7 +57,7 @@ func TestLimiterCapsAtBurst(t *testing.T) {
 
 	later := limiterNow.Add(time.Hour)
 	for i := 0; i < 2; i++ {
-		assert.True(t, limiter.Allow(later), "пополнение не превышает всплеск")
+		assert.True(t, limiter.Allow(later), "refill does not exceed the burst")
 	}
 	assert.False(t, limiter.Allow(later))
 }
@@ -67,7 +67,7 @@ func TestLimiterClockSkew(t *testing.T) {
 
 	limiter := domain.NewLimiter(10, 1)
 	assert.True(t, limiter.Allow(limiterNow))
-	assert.False(t, limiter.Allow(limiterNow.Add(-time.Second)), "обратный ход часов не пополняет bucket")
+	assert.False(t, limiter.Allow(limiterNow.Add(-time.Second)), "a clock going backwards does not refill the bucket")
 }
 
 func TestLimiterConcurrent(t *testing.T) {
@@ -87,5 +87,5 @@ func TestLimiterConcurrent(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	assert.Equal(t, int64(burst), allowed.Load(), "конкурентные вызовы расходуют ровно всплеск")
+	assert.Equal(t, int64(burst), allowed.Load(), "concurrent calls consume exactly the burst")
 }

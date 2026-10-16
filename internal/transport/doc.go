@@ -1,3 +1,3 @@
-// Пакет transport содержит транспортный слой сервиса webhook-ingress:
-// HTTP-хендлеры Gin и gRPC-обработчики, собранные из usecase.
+// Package transport contains the transport layer of the webhook-ingress service:
+// Gin HTTP handlers and gRPC handlers assembled from usecase.
 package transport

@@ -1,3 +1,3 @@
-// Пакет storage содержит доступ к хранилищам сервиса webhook-ingress:
-// GORM-репозитории, миграции и интеграцию с outbox/inbox.
+// Package storage contains storage access of the webhook-ingress service:
+// GORM repositories, migrations and integration with outbox/inbox.
 package storage

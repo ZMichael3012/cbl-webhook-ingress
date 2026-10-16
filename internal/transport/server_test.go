@@ -36,7 +36,7 @@ type fakeHandler struct {
 	err       error
 }
 
-// Handle записывает вызовы для проверок транспорта.
+// Handle records calls for transport checks.
 func (f *fakeHandler) Handle(_ context.Context, in usecase.WebhookInput) (bool, error) {
 	f.calls++
 	f.lastInput = in
@@ -96,7 +96,7 @@ func TestHandleWebhookSuccess(t *testing.T) {
 	assert.Equal(t, "g-1", handler.lastInput.GatewayID)
 	assert.Equal(t, body, string(handler.lastInput.RawBody))
 	for key := range handler.lastInput.Headers {
-		assert.Falsef(t, strings.EqualFold(key, "X-Signature"), "заголовок подписи %s не должен сохраняться", key)
+		assert.Falsef(t, strings.EqualFold(key, "X-Signature"), "signature header %s must not be stored", key)
 	}
 }
 
@@ -159,8 +159,8 @@ func TestHandleWebhookFiltersSensitiveHeaders(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rec.Code)
 	for key := range handler.lastInput.Headers {
-		assert.Falsef(t, strings.EqualFold(key, "authorization"), "заголовок %s не должен сохраняться", key)
-		assert.Falsef(t, strings.EqualFold(key, "cookie"), "заголовок %s не должен сохраняться", key)
+		assert.Falsef(t, strings.EqualFold(key, "authorization"), "header %s must not be stored", key)
+		assert.Falsef(t, strings.EqualFold(key, "cookie"), "header %s must not be stored", key)
 	}
 }
 
@@ -299,8 +299,8 @@ func TestHandleWebhookIPAllowlistBeforeBodyAndSignature(t *testing.T) {
 	handler := &fakeHandler{processed: true}
 	router := newTestRouterWithProviders(allowlistProviders(t), handler, transport.WithMaxBody(16))
 
-	// Тело сверх лимита и отсутствующая подпись: если бы тело читалось или
-	// подпись проверялась до allowlist, ответ был бы 413 или 401.
+	// Body over the limit and a missing signature: if the body were read or the
+	// signature verified before the allowlist, the response would be 413 or 401.
 	req := httptest.NewRequest(http.MethodPost, "/hooks/mock/ep1", strings.NewReader(strings.Repeat("a", 100)))
 	req.RemoteAddr = "198.51.100.9:41234"
 	rec := httptest.NewRecorder()
@@ -332,7 +332,7 @@ func TestHandleWebhookRateLimited(t *testing.T) {
 	router.ServeHTTP(first, requestFrom("203.0.113.7:1", "{}", "vendor-1"))
 	require.Equal(t, http.StatusOK, first.Code)
 
-	// Тело сверх лимита и отсутствующая подпись: лимит проверяется раньше.
+	// Body over the limit and a missing signature: the rate limit is checked earlier.
 	second := httptest.NewRequest(http.MethodPost, "/hooks/mock/ep1", strings.NewReader(strings.Repeat("a", 1024)))
 	second.RemoteAddr = "203.0.113.7:1"
 	rec := httptest.NewRecorder()
@@ -340,7 +340,7 @@ func TestHandleWebhookRateLimited(t *testing.T) {
 	require.Equal(t, http.StatusTooManyRequests, rec.Code)
 	assert.Equal(t, "1", rec.Header().Get("Retry-After"))
 	assert.Contains(t, rec.Body.String(), "rate_limited")
-	assert.Equal(t, 1, handler.calls, "отклоненный запрос не доходит до записи")
+	assert.Equal(t, 1, handler.calls, "a rejected request does not reach the write")
 }
 
 func TestHandleWebhookRateLimitRefill(t *testing.T) {
@@ -383,7 +383,7 @@ func TestHandleWebhookRateLimitRefill(t *testing.T) {
 
 	third := httptest.NewRecorder()
 	router.ServeHTTP(third, requestFrom("203.0.113.7:1", "{}", "vendor-3"))
-	require.Equal(t, http.StatusOK, third.Code, "токен восстанавливается по времени")
+	require.Equal(t, http.StatusOK, third.Code, "the token is refilled over time")
 }
 
 func TestHandleWebhookExpiredSignature(t *testing.T) {
@@ -425,14 +425,14 @@ func TestHandleWebhookHandlerError(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), "internal_error")
 }
 
-// blockingHandler имитирует медленную запись в PostgreSQL, которая
-// не укладывается в бюджет ответа.
+// blockingHandler simulates a slow PostgreSQL write that
+// does not fit into the response budget.
 type blockingHandler struct {
 	calls int
 }
 
-// Handle ждет дедлайна контекста и возвращает обернутую ошибку, как это
-// делает usecase-обвязка поверх прерванной транзакции.
+// Handle waits for the context deadline and returns a wrapped error, the same way
+// the usecase wrapper does on top of an aborted transaction.
 func (h *blockingHandler) Handle(ctx context.Context, _ usecase.WebhookInput) (bool, error) {
 	h.calls++
 	<-ctx.Done()
@@ -455,7 +455,7 @@ func TestHandleWebhookWriteTimeout(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(3 * time.Second):
-		t.Fatal("обработчик не завершился по бюджету записи")
+		t.Fatal("handler did not finish within the write budget")
 	}
 
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
@@ -464,13 +464,13 @@ func TestHandleWebhookWriteTimeout(t *testing.T) {
 	assert.Equal(t, 1, handler.calls)
 }
 
-// dialTimeoutHandler имитирует исчерпание бюджета на установлении соединения
-// с PostgreSQL (Linux): dial завершается os.ErrDeadlineExceeded ("i/o timeout").
+// dialTimeoutHandler simulates budget exhaustion on PostgreSQL connection
+// establishment (Linux): dial terminates with os.ErrDeadlineExceeded ("i/o timeout").
 type dialTimeoutHandler struct {
 	calls int
 }
 
-// Handle ждет дедлайна контекста и возвращает ошибку в форме pgx на Linux.
+// Handle waits for the context deadline and returns an error in the Linux pgx form.
 func (h *dialTimeoutHandler) Handle(ctx context.Context, _ usecase.WebhookInput) (bool, error) {
 	h.calls++
 	<-ctx.Done()
@@ -493,7 +493,7 @@ func TestHandleWebhookWriteTimeoutOnDialError(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(3 * time.Second):
-		t.Fatal("обработчик не завершился по бюджету записи")
+		t.Fatal("handler did not finish within the write budget")
 	}
 
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
@@ -505,8 +505,8 @@ func TestHandleWebhookWriteTimeoutOnDialError(t *testing.T) {
 func TestHandleWebhookIoTimeoutIsWriteTimeout(t *testing.T) {
 	t.Parallel()
 
-	// i/o таймаут в write-пути (единственный внешний I/O - PostgreSQL под
-	// бюджетом) классифицируется как исчерпание бюджета.
+	// An i/o timeout in the write path (the only external I/O is PostgreSQL under
+	// the budget) is classified as budget exhaustion.
 	handler := &fakeHandler{err: fmt.Errorf("usecase: save webhook: dial error: %w", os.ErrDeadlineExceeded)}
 	router := newTestRouter(handler)
 

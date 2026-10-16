@@ -122,7 +122,7 @@ type recordingPublisher struct {
 	events []outbox.Envelope
 }
 
-// Publish записывает конверты для проверки relay.
+// Publish records envelopes for relay verification.
 func (p *recordingPublisher) Publish(_ context.Context, env outbox.Envelope) error {
 	p.events = append(p.events, env)
 	return nil
@@ -155,8 +155,8 @@ func TestIntegrationWriteTimeoutRollsBackAndRetries(t *testing.T) {
 	realHandler := usecase.NewHandler(db, "cbl-webhook-ingress", zap.NewNop())
 	router := newTestRouter(realHandler, transport.WithWriteTimeout(150*time.Millisecond))
 
-	// Блокировка таблицы inbox воспроизводит медленную запись: транзакция
-	// обработчика зависает на вставке и прерывается бюджетом.
+	// Locking the inbox table reproduces a slow write: the handler
+	// transaction hangs on the insert and is aborted by the budget.
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	conn, err := sqlDB.Conn(context.Background())
@@ -179,13 +179,13 @@ func TestIntegrationWriteTimeoutRollsBackAndRetries(t *testing.T) {
 
 	var count int64
 	require.NoError(t, db.Table("outbox").Count(&count).Error)
-	assert.Equal(t, int64(0), count, "прерванная транзакция не оставляет outbox-строк")
+	assert.Equal(t, int64(0), count, "an aborted transaction leaves no outbox rows")
 	require.NoError(t, db.Table("inbox").Count(&count).Error)
-	assert.Equal(t, int64(0), count, "прерванная транзакция не оставляет inbox-строк")
+	assert.Equal(t, int64(0), count, "an aborted transaction leaves no inbox rows")
 
 	retry := httptest.NewRecorder()
 	router.ServeHTTP(retry, signedRequest(body, "vendor-timeout", fixedNow))
-	require.Equal(t, http.StatusOK, retry.Code, "повтор после снятия блокировки")
+	require.Equal(t, http.StatusOK, retry.Code, "retry after the lock is released")
 	assert.Contains(t, retry.Body.String(), `"duplicate":false`)
 	require.NoError(t, db.Table("outbox").Count(&count).Error)
 	assert.Equal(t, int64(1), count)
@@ -209,7 +209,7 @@ func TestIntegrationAllowlistActive(t *testing.T) {
 	require.NoError(t, err)
 	router := newTestRouterWithProviders(providers, realHandler)
 
-	// Адрес по умолчанию httptest (192.0.2.1) входит в allowlist.
+	// The default httptest address (192.0.2.1) is inside the allowlist.
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, signedRequest(`{"gateway_id":"g-al"}`, "vendor-al", fixedNow))
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -266,7 +266,7 @@ func TestIntegrationConcurrentDuplicates(t *testing.T) {
 			fresh++
 		}
 	}
-	assert.Equal(t, 1, fresh, "ровно один конкурентный запрос создает событие")
+	assert.Equal(t, 1, fresh, "exactly one concurrent request creates the event")
 
 	var outboxCount, inboxCount int64
 	require.NoError(t, db.Table("outbox").Count(&outboxCount).Error)

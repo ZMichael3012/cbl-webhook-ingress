@@ -1,125 +1,128 @@
-# CBL-5.2. Inbox по ID события и outbox с бюджетом ответа
+# CBL-5.2. Inbox by event ID and outbox with a response budget
 
-| Поле | Значение |
+| Field | Value |
 | :-- | :-- |
-| Эпик | E5, Webhook Ingress |
-| Репозиторий | `cbl-webhook-ingress` |
-| Размер | M |
-| Волна и параллельная группа | W1-WEBHOOK |
-| Зависит от | 5.1, 1.2 (cbl-kit/outbox), 1.3 (cbl-kit/inbox) |
-| Версия контрактов | `cbl-protos@cf-1` (`billing/events/v1`), `CBL-003` разделы 4, 6 |
-| Статус | done, ревью закрыто |
+| Epic | E5, Webhook Ingress |
+| Repository | `cbl-webhook-ingress` |
+| Size | M |
+| Wave and parallel group | W1-WEBHOOK |
+| Depends on | 5.1, 1.2 (cbl-kit/outbox), 1.3 (cbl-kit/inbox) |
+| Contract version | `cbl-protos@cf-1` (`billing/events/v1`), `CBL-003` sections 4, 6 |
+| Status | done, review closed |
 
-## 1. Контекст и цель
+## 1. Context and goal
 
-Ядро механики 5.2 (inbox по `event_id`, outbox-конверт `gateway.webhooks.raw`, relay,
-ответ без ожидания Kafka) реализовано в 5.1 сверх плана задачи (FR-3, FR-4 спеки 5.1).
-Задача 5.2 закрывает оставшиеся критерии приемки: идемпотентность при конкурентных
-доставках одного события и защита бюджета ответа (~500 мс) от деградации PostgreSQL.
+The core mechanics of 5.2 (inbox by `event_id`, the `gateway.webhooks.raw` outbox envelope, the
+relay, the response without waiting for Kafka) were implemented in 5.1 beyond the task plan
+(FR-3, FR-4 of spec 5.1). Task 5.2 closes the remaining acceptance criteria: idempotency under
+concurrent deliveries of the same event and protection of the response budget (~500 ms) against
+PostgreSQL degradation.
 
-## 2. Границы
+## 2. Boundaries
 
-In scope: гарантии однократной записи при конкурентных дублях, дедлайн записи с
-детерминированным ответом, фиксация инвариантов конверта тестами.
-Out of scope: нормализация (3.5), тело/подпись (5.1), лимиты и allowlist (5.3),
-нагрузочный профиль (5.4), метрики outbox lag (0.7).
+In scope: single-write guarantees under concurrent duplicates, a write deadline with a
+deterministic response, capturing envelope invariants in tests.
+Out of scope: normalization (3.5), body/signature (5.1), limits and allowlist (5.3), load
+profile (5.4), outbox lag metrics (0.7).
 
-## 3. Функциональные требования
+## 3. Functional requirements
 
-FR-1. Конкурентные доставки одного события не создают больше одной строки: ровно одна
-строка inbox `(consumer=provider, event_id)` и ровно одна строка outbox на событие;
-ровно один ответ среди конкурентных имеет `duplicate=false`, остальные `duplicate=true`
-(все 200). Обеспечивается уникальным ключом inbox и `ON CONFLICT DO NOTHING` в
-`inbox.Guard`; проигравшая гонку транзакция не пишет outbox.
+FR-1. Concurrent deliveries of the same event create no more than one row: exactly one inbox row
+`(consumer=provider, event_id)` and exactly one outbox row per event; exactly one response among
+the concurrent ones has `duplicate=false`, the rest have `duplicate=true` (all 200). This is
+ensured by the unique inbox key and `ON CONFLICT DO NOTHING` in `inbox.Guard`; the transaction
+that loses the race does not write to the outbox.
 
-FR-2. Бюджет ответа: вызов `Handler.Handle` ограничен дедлайном `WEBHOOK_WRITE_TIMEOUT`
-(по умолчанию 450 мс, допустимый диапазон 100 мс - 5 с; пустое значение - дефолт,
-невалидное - сервис не стартует). При превышении дедлайна транзакция прерывается
-(контекст pgx отменяет запрос и откатывает транзакцию), клиент получает
-`503 application/problem+json` c `Retry-After: 1`. Событие не считается принятым;
-провайдер повторяет доставку, идемпотентность (FR-1) исключает дубли. Отмена клиентом
-(`context.Canceled`) классифицируется отдельно: лог уровня `info`, ответ `408` без
-побочных эффектов (ответ не важен, метрика доли ошибок не засоряется). Остальные
-ошибки записи по-прежнему `500`.
+FR-2. Response budget: the `Handler.Handle` call is bounded by the `WEBHOOK_WRITE_TIMEOUT`
+deadline (450 ms by default, allowed range 100 ms - 5 s; an empty value means the default, an
+invalid one means the service does not start). When the deadline is exceeded, the transaction is
+aborted (the pgx context cancels the query and rolls back the transaction), and the client
+receives `503 application/problem+json` with `Retry-After: 1`. The event is not considered
+accepted; the provider retries the delivery, and idempotency (FR-1) excludes duplicates. A
+client-side cancellation (`context.Canceled`) is classified separately: an `info` level log, a
+`408` response with no side effects (the response does not matter, the error rate metric is not
+polluted). Other write errors remain `500`.
 
-FR-3. Инварианты конверта закрепляются тестами: топик `gateway.webhooks.raw`, тип
-события `gateway.webhook.raw`, детерминированный `event_id` = UUIDv5 от
-`"cbl-webhook:" + provider + ":" + vendor_event_id` (`CBL-5.1` FR-4a), схема `v1`,
-ключ партиции `provider:gateway_id` (фолбэк `provider:endpoint_id`), поле конверта
-`signature_verified=true`, заголовки `provider`, `vendor_event_id`, `endpoint_id`.
+FR-3. Envelope invariants are pinned down by tests: the topic `gateway.webhooks.raw`, the event
+type `gateway.webhook.raw`, the deterministic `event_id` = UUIDv5 from
+`"cbl-webhook:" + provider + ":" + vendor_event_id` (`CBL-5.1` FR-4a), the schema `v1`, the
+partition key `provider:gateway_id` (fallback `provider:endpoint_id`), the envelope field
+`signature_verified=true`, the headers `provider`, `vendor_event_id`, `endpoint_id`.
 
-FR-4. Дубликат и таймаут различаются в логах: дубликат - `info` с provider и
-vendor_event_id, таймаут записи - `warn` с provider и длительностью бюджета.
+FR-4. A duplicate and a timeout are distinguished in logs: a duplicate is `info` with provider
+and vendor_event_id, a write timeout is `warn` with provider and the budget duration.
 
-## 4. Контракты
+## 4. Contracts
 
-Внешний HTTP-контракт не меняется (`CBL-003`, раздел 4): добавляется только ответ `503`
-с `Retry-After` при исчерпании бюджета. Конверт и заголовки - `CBL-003`, раздел 6;
-proto `billing/events/v1/GatewayWebhookRaw` (CF-1).
+The external HTTP contract does not change (`CBL-003`, section 4): only the `503` response with
+`Retry-After` is added when the budget is exhausted. The envelope and headers are in `CBL-003`,
+section 6; proto `billing/events/v1/GatewayWebhookRaw` (CF-1).
 
-## 5. Модель данных и миграции
+## 5. Data model and migrations
 
-Новых миграций нет: схема inbox/outbox зафиксирована в 5.1
-(`migrations/00001_outbox.sql`, `00002_inbox.sql`).
+No new migrations: the inbox/outbox schema was fixed in 5.1 (`migrations/00001_outbox.sql`,
+`00002_inbox.sql`).
 
-## 6. Конечные автоматы
+## 6. State machines
 
-Не применимо.
+Not applicable.
 
 ## 7. Edge cases
 
-N одновременных идентичных доставок (проверка FR-1); повторная доставка после 503
-(событие обрабатывается, дублей нет); медленный PostgreSQL (503 и повторы провайдера);
-отмена клиентом (контекст отменен, ответ не важен); дедлайн больше серверного
-`WriteTimeout` (клэмп 5 с); невалидный `WEBHOOK_WRITE_TIMEOUT` (отказ старта);
-дедлайн меньше 100 мс (клэмп); событие с `gateway_id` в теле и без него.
+N simultaneous identical deliveries (FR-1 verification); repeated delivery after a 503 (the
+event is processed, there are no duplicates); slow PostgreSQL (503 and provider retries);
+client-side cancellation (the context is canceled, the response does not matter); a deadline
+greater than the server `WriteTimeout` (clamped to 5 s); an invalid `WEBHOOK_WRITE_TIMEOUT`
+(startup failure); a deadline less than 100 ms (clamped); an event with and without `gateway_id`
+in the body.
 
-## 8. Нефункциональные требования
+## 8. Non-functional requirements
 
-p99 ответа менее 500 мс при всплеске (измерение - 5.4); дедлайн записи по умолчанию
-450 мс оставляет запас на сеть и сериализацию в бюджете 500 мс; 503 не должен
-возникать при штатной нагрузке (проверка в 5.4: без 5xx).
+Response p99 under 500 ms under burst (measured in 5.4); the default write deadline of 450 ms
+leaves headroom for network and serialization within the 500 ms budget; 503 must not occur under
+normal load (verified in 5.4: no 5xx).
 
-## 9. План тестов
+## 9. Test plan
 
-| Уровень | Сценарии |
+| Level | Scenarios |
 | :-- | :-- |
-| Unit | транспорт: дедлайн исчерпан -> 503 + `Retry-After`; прочие ошибки -> 500; домен: разбор `WEBHOOK_WRITE_TIMEOUT` (дефолт, клэмпы, ошибка) |
-| Integration | PostgreSQL: 8 конкурентных доставок одного события -> одна строка inbox, одна строка outbox, один `duplicate=false`; реальный дедлайн при заблокированной таблице inbox -> 503 и откат, повтор после снятия блокировки -> 200 `duplicate=false`; инварианты конверта (event_id, тип, схема, заголовки) |
-| E2E | существующий сценарий 5.1 (без изменений) |
+| Unit | transport: deadline exhausted -> 503 + `Retry-After`; other errors -> 500; domain: `WEBHOOK_WRITE_TIMEOUT` parsing (default, clamps, error) |
+| Integration | PostgreSQL: 8 concurrent deliveries of the same event -> one inbox row, one outbox row, one `duplicate=false`; a real deadline with the inbox table locked -> 503 and rollback, a retry after the lock is released -> 200 `duplicate=false`; envelope invariants (event_id, type, schema, headers) |
+| E2E | the existing scenario 5.1 (unchanged) |
 | Load | 5.4 |
 
-## 10. План работ и коммит
+## 10. Work plan and commit
 
-Тесты вперед: unit на дедлайн и разбор конфигурации, integration на конкурентные дубли.
-Затем реализация: `domain.ParseWriteTimeout`, опция `WithWriteTimeout`, обвязка main.
-Коммит `CBL-5.2: inbox и outbox с бюджетом ответа`; спека в том же коммите.
+Tests first: unit tests for the deadline and configuration parsing, integration tests for
+concurrent duplicates. Then the implementation: `domain.ParseWriteTimeout`, the `WithWriteTimeout`
+option, main wiring. Commit `CBL-5.2: inbox and outbox with a response budget`; the spec is in
+the same commit.
 
-## 11. Открытые вопросы
+## 11. Open questions
 
-- T-WH-02 (переиспользование vendor id с меняющимся статусом) остается открытым до
-  выбора шлюза (KI-01): текущий контракт поставки события предполагает уникальный id
-  на событие; при ином поведении провайдера ключ будет включать статус до выбора 3.2.
-- Retry-шторм при затяжной деградации PostgreSQL (каждый 503 с `Retry-After: 1`
-  провоцирует повтор) принимается осознанно (T-WH-04); поведение и метрики проверяются
-  нагрузкой 5.4 (KI-webhook-ingress-02), при подтверждении шторма - jitter или более
-  консервативный `Retry-After`.
-- Метрика outbox lag - задача 0.7 (не меняется).
-- Руководство `cbl-kit/outbox` описывает `event_id` как UUIDv7, а сырые вебхуки
-  используют детерминированный UUIDv5 (FR-3): конверт принимает любой UUID, правка
-  docstring библиотеки - при следующей задаче по kit.
+- T-WH-02 (reuse of a vendor id with a changing status) remains open until the gateway choice
+  (KI-01): the current event delivery contract assumes a unique id per event; with different
+  provider behavior the key will include the status before 3.2 is chosen.
+- The retry storm under prolonged PostgreSQL degradation (each 503 with `Retry-After: 1`
+  provokes a retry) is accepted deliberately (T-WH-04); the behavior and metrics are verified by
+  load test 5.4 (KI-webhook-ingress-02); if the storm is confirmed, jitter or a more
+  conservative `Retry-After`.
+- The outbox lag metric is task 0.7 (unchanged).
+- The `cbl-kit/outbox` guide describes `event_id` as UUIDv7, while raw webhooks use a
+  deterministic UUIDv5 (FR-3): the envelope accepts any UUID; the library docstring will be
+  fixed in the next kit task.
 
-## 12. Ревью (CBL-001, шаг 6)
+## 12. Review (CBL-001, step 6)
 
-Четыре независимых прохода (14.10.2026). Блокеров нет; major архитектурного ревью
-(реальный дедлайн БД не был покрыт тестом) закрыт интеграционным сценарием с блокировкой
-таблицы; прочие замечания закрыты правками: отдельная ветка `context.Canceled`,
-клэмп в `WithWriteTimeout`, исключение заголовка подписи из сохраняемых заголовков,
-согласование документов (CBL-003, AGENTS, журнал).
+Four independent passes (14.10.2026). No blockers; the architecture review major (the real DB
+deadline was not covered by a test) was closed by an integration scenario with a table lock;
+the remaining findings were closed by fixes: a separate `context.Canceled` branch, the clamp in
+`WithWriteTimeout`, exclusion of the signature header from the stored headers, document
+alignment (CBL-003, AGENTS, journal).
 
-| Роль | Ключевые замечания | Закрытие |
+| Role | Key findings | Closure |
 | :-- | :-- | :-- |
-| Без контекста | edge cases раздела 7 (повтор после 503, медленный PostgreSQL) не покрыты; `event_id` UUIDv5 против формулировки CBL-003; журнал опережает процесс; отсутствие клэмпа в опции; слабая защита теста от регрессии; конкурентный тест не проверяет `duplicate=true` | добавлен интеграционный тест реального дедлайна с откатом и повтором; примечание про UUIDv5 в CBL-003 разделе 6; раздел 12 заполнен этим блоком; клэмп в опции; тест с `select`/таймаутом; проверка `fresh == 1` среди 8 ответов |
-| Архитектуры | MAJOR: дедлайн через реальную цепочку gorm -> pgx не тестировался (узкая гонка со `sql.ErrTxDone`); `context.Canceled` логировался как Error; UUIDv5 против CBL-003; T-WH-04 не связан с KI-01 | интеграционный тест блокировки, отката и повтора; ветка `context.Canceled` (info, 408); примечание в CBL-003; связь с KI-01 зафиксирована в T-WH-04 и этом разделе |
-| С контекстом | ссылка T-WH-02 на 5.2 противоречит факту; журнал/CBL-004 опережают процесс; потенциальная гонка `gin.SetMode` при `-race`; бюджет теста не задан явно; warn-лог без request_id | ссылка исправлена на 3.2/KI-01; финализация этим блоком; унаследованный паттерн зафиксирован в KI-webhook-ingress-01 (CI, 0.2); бюджет задан явно в тесте; request_id добавится с наблюдаемостью 0.7 |
-| Безопасности | retry-шторм 503 (MINOR, не блокер); отсутствие клэмпа в публичной опции; заголовок подписи сохранялся в конверт; код возврата 0 при ошибке конфигурации (унаследовано) | связь с 5.4/KI-02 зафиксирована в разделе 11; клэмп добавлен; заголовок подписи исключается из `flattenHeaders`; паттерн кода возврата - унаследованное поведение (0.2/0.7) |
+| No context | the section 7 edge cases (retry after a 503, slow PostgreSQL) were not covered; `event_id` UUIDv5 versus the CBL-003 wording; the journal runs ahead of the process; no clamp in the option; weak regression protection of the test; the concurrency test does not check `duplicate=true` | an integration test of the real deadline with rollback and retry was added; a note about UUIDv5 in CBL-003 section 6; section 12 filled in by this block; a clamp in the option; a test with `select`/timeout; checking `fresh == 1` among the 8 responses |
+| Architecture | MAJOR: the deadline through the real gorm -> pgx chain was not tested (a narrow race with `sql.ErrTxDone`); `context.Canceled` was logged as Error; UUIDv5 versus CBL-003; T-WH-04 is not linked to KI-01 | an integration test of the lock, rollback and retry; the `context.Canceled` branch (info, 408); a note in CBL-003; the link to KI-01 is recorded in T-WH-04 and this section |
+| With context | the T-WH-02 reference to 5.2 contradicts the fact; the journal/CBL-004 run ahead of the process; a potential `gin.SetMode` race under `-race`; the test budget is not set explicitly; the warn log has no request_id | the reference was corrected to 3.2/KI-01; finalization by this block; the inherited pattern is recorded in KI-webhook-ingress-01 (CI, 0.2); the budget is set explicitly in the test; request_id will be added with observability in 0.7 |
+| Security | the 503 retry storm (MINOR, not a blocker); no clamp in the public option; the signature header was stored in the envelope; return code 0 on a configuration error (inherited) | the link to 5.4/KI-02 is recorded in section 11; the clamp was added; the signature header is excluded from `flattenHeaders`; the return code pattern is inherited behavior (0.2/0.7) |

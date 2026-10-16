@@ -1,137 +1,141 @@
-# CBL-5.4. Нагрузочный профиль всплеска вебхуков
+# CBL-5.4. Webhook burst load profile
 
-| Поле | Значение |
+| Field | Value |
 | :-- | :-- |
-| Эпик | E5, Webhook Ingress |
-| Репозиторий | `cbl-webhook-ingress` |
-| Размер | S |
-| Волна и параллельная группа | W1-WEBHOOK |
-| Зависит от | 5.2, 5.3 |
-| Версия контрактов | `cbl-protos@cf-1`, `CBL-003` разделы 4 |
-| Статус | done, ревью закрыто |
+| Epic | E5, Webhook Ingress |
+| Repository | `cbl-webhook-ingress` |
+| Size | S |
+| Wave and parallel group | W1-WEBHOOK |
+| Depends on | 5.2, 5.3 |
+| Contract version | `cbl-protos@cf-1`, `CBL-003` section 4 |
+| Status | done, review closed |
 
-## 1. Контекст и цель
+## 1. Context and goal
 
-Стартовый порог `CBL-002` (раздел 8): всплеск вебхуков, p99 ответа менее 500 мс, без 5xx.
-Профиль подтверждает бюджет ответа 5.2, лимиты 5.3 и способность сервиса принять
-всплеск доставки провайдера без ошибок сервера.
+The `CBL-002` startup threshold (section 8): webhook burst, response p99 under 500 ms, no
+5xx. The profile confirms the 5.2 response budget, the 5.3 limits and the ability of the
+service to accept a provider delivery burst without server errors.
 
-## 2. Границы
+## 2. Boundaries
 
-In scope: k6-профиль всплеска на compose-стенд сервиса; профиль деградации PostgreSQL
-(проверка 503 с `Retry-After`); фиксация результатов и закрытие KI-webhook-ingress-02.
-Out of scope: глобальный смешанный профиль 3000 RPS (зонтичный репозиторий, 14.1),
-тюнинг PostgreSQL, нагрузка Kafka.
+In scope: a k6 burst profile against the service compose stand; a PostgreSQL degradation
+profile (verification of `503` with `Retry-After`); recording of the results and closure
+of KI-webhook-ingress-02.
 
-## 3. Функциональные требования
+Out of scope: the global mixed profile of 3000 RPS (umbrella repository, 14.1),
+PostgreSQL tuning, Kafka load.
 
-FR-1. Профиль всплеска (`PROFILE=burst`, по умолчанию): `ramping-arrival-rate`
-50 -> 500 rps (одна стадия разгона 10 с), плато 500 rps 30 с, спад до 50 rps за 5 с;
-каждый запрос - уникальное подписанное событие (HMAC по сырому телу, уникальный
-`X-Event-Id` на запуск), ожидаемый ответ - `200` с `status=accepted` и
-`duplicate=false`. Пороги: `p(99) < 500 мс`, `checks > 0.999`,
-`http_req_failed < 0.001`, 5xx отсутствуют (счетчик `server_errors == 0`),
-`rate_limited == 0`, `unexpected_responses == 0`, потери итераций менее 1%
-(`dropped_iterations < 192` от ~19 125 запросов).
+## 3. Functional requirements
 
-FR-2. Профиль деградации (`PROFILE=degraded`): PostgreSQL приостановлен, 20 rps 15 с;
-ожидаемый ответ каждого запроса - `503 write_timeout` с `Retry-After: 1` и признаком
-`write_timeout` в problem+json (бюджет записи 5.2), любые другие ответы фиксируются как
-`unexpected_responses` (порог 0), потери итераций менее 1 (`dropped_iterations < 3`);
-потери событий нет: после снятия паузы повторная доставка обрабатывается
-идемпотентно (покрыто интеграционным тестом 5.2).
+FR-1. Burst profile (`PROFILE=burst`, default): `ramping-arrival-rate`
+50 -> 500 rps (one ramp-up stage of 10 s), a plateau of 500 rps for 30 s, a decline to
+50 rps over 5 s; each request is a unique signed event (HMAC over the raw body, a unique
+`X-Event-Id` per run), the expected response is `200` with `status=accepted` and
+`duplicate=false`. Thresholds: `p(99) < 500 ms`, `checks > 0.999`,
+`http_req_failed < 0.001`, no 5xx (the `server_errors == 0` counter),
+`rate_limited == 0`, `unexpected_responses == 0`, iteration drops under 1%
+(`dropped_iterations < 192` out of ~19 125 requests).
 
-FR-3. Лимит приема на стенде (5.3) настроен выше профиля (`rate_rps=1000`,
-`rate_burst=2000` в compose): `429` в профиле всплеска быть не должно
-(`rate_limited == 0`).
+FR-2. Degradation profile (`PROFILE=degraded`): PostgreSQL paused, 20 rps for 15 s; the
+expected response of every request is `503 write_timeout` with `Retry-After: 1` and the
+marker `write_timeout` in problem+json (the 5.2 write budget), any other responses are
+recorded as `unexpected_responses` (threshold 0), iteration drops under 1
+(`dropped_iterations < 3`); there is no event loss: after the pause is lifted a repeated
+delivery is processed idempotently (covered by integration test 5.2).
 
-FR-4. Команды запуска зафиксированы в шапке `test/load/webhook_burst.js`
-(cmd.exe и PowerShell), k6 запускается контейнером `grafana/k6:2.3.0`.
+FR-3. The intake limit on the stand (5.3) is configured above the profile
+(`rate_rps=1000`, `rate_burst=2000` in compose): there must be no `429` in the burst
+profile (`rate_limited == 0`).
 
-## 4. Контракты
+FR-4. The launch commands are recorded in the header of `test/load/webhook_burst.js`
+(cmd.exe and PowerShell); k6 is launched with the `grafana/k6:2.3.0` container.
 
-Внешние контракты не меняются: профиль использует `POST /hooks/{provider}/{endpoint_id}`
-с HMAC-заголовком из `CBL-003` (раздел 4).
+## 4. Contracts
 
-## 5. Модель данных и миграции
+External contracts do not change: the profile uses
+`POST /hooks/{provider}/{endpoint_id}` with the HMAC header from `CBL-003` (section 4).
 
-Не применимо; стенд использует существующие миграции 00001 - 00002.
+## 5. Data model and migrations
 
-## 6. Конечные автоматы
+Not applicable; the stand uses the existing migrations 00001 - 00002.
 
-Не применимо.
+## 6. State machines
+
+Not applicable.
 
 ## 7. Edge cases
 
-`429` при переполнении лимита (не ожидается, фиксируется); `503` при паузе
-PostgreSQL (ожидаем в профиле деградации); клиентские таймауты k6 выше серверных
-(ReadTimeout 15 с); повторный запуск с новым `RUN_ID` не является replay (уникальные
-event id); пустой `KAFKA_BROKERS` (outbox копится, ответ не деградирует).
+`429` on limit overflow (not expected, is recorded); `503` while PostgreSQL is paused
+(expected in the degradation profile); k6 client timeouts are higher than the server ones
+(ReadTimeout 15 s); a repeated run with a new `RUN_ID` is not a replay (unique event
+ids); an empty `KAFKA_BROKERS` (the outbox accumulates, the response does not degrade).
 
-## 8. Нефункциональные требования и результаты
+## 8. Non-functional requirements and results
 
-Профиль всплеска (локально, Docker Desktop, compose-стенд, 500 rps плато, 19124 запроса):
+Burst profile (locally, Docker Desktop, compose stand, 500 rps plateau, 19124 requests):
 
-| Метрика | Значение | Порог |
+| Metric | Value | Threshold |
 | :-- | :-- | :-- |
-| p99 ответа | 25.36 мс | менее 500 мс |
+| Response p99 | 25.36 ms | under 500 ms |
 | 5xx | 0 | 0 |
-| Доля прочих ошибок (`http_req_failed`) | 0% | менее 0.1% |
-| Пропущенные итерации | 0 | менее 1% (`count<192`) |
+| Share of other errors (`http_req_failed`) | 0% | under 0.1% |
+| Dropped iterations | 0 | under 1% (`count<192`) |
 | `429 rate_limited` | 0 | 0 |
 | `unexpected_responses` | 0 | 0 |
 
-Профиль деградации (PostgreSQL приостановлен, 20 rps, 301 запрос): 100% ответов
-`503 write_timeout` с `Retry-After: 1`, p99 459.7 мс (бюджет записи 450 мс + накладные),
-`unexpected_responses = 0`, итерации не пропущены; после снятия паузы повторные
-доставки обрабатываются идемпотентно (интеграционный тест 5.2), накопленный outbox
-публикуется relay (топик создает `kafka-init`).
+Degradation profile (PostgreSQL paused, 20 rps, 301 requests): 100% of responses were
+`503 write_timeout` with `Retry-After: 1`, p99 459.7 ms (write budget 450 ms plus
+overhead), `unexpected_responses = 0`, no iterations dropped; after the pause is lifted,
+repeated deliveries are processed idempotently (integration test 5.2), and the
+accumulated outbox is published by relay (the topic is created by `kafka-init`).
 
-## 9. План тестов
+## 9. Test plan
 
-| Уровень | Сценарии |
+| Level | Scenarios |
 | :-- | :-- |
-| Load | `PROFILE=burst` (пороги выше, прогон выполнен); `PROFILE=degraded` (503 + Retry-After, без прочих 5xx, прогон выполнен) |
-| Smoke | `make build`, `make test`, существующие unit/integration/e2e зеленые |
+| Load | `PROFILE=burst` (thresholds above, the run is performed); `PROFILE=degraded` (503 + Retry-After, no other 5xx, the run is performed) |
+| Smoke | `make build`, `make test`, existing unit/integration/e2e green |
 
-## 10. План работ и коммит
+## 10. Work plan and commit
 
-`test/load/webhook_burst.js` (профили burst/degraded, HMAC на k6/crypto), прогон на
-compose-стенде, фиксация результатов в спеке и AGENTS. Коммит
-`CBL-5.4: нагрузочный профиль всплеска вебхуков`; спека в том же коммите.
+`test/load/webhook_burst.js` (burst/degraded profiles, HMAC on k6/crypto), a run on the
+compose stand, recording of the results in the spec and AGENTS. Commit
+`CBL-5.4: webhook burst load profile`; the spec is in the same commit.
 
-## 11. Открытые вопросы
+## 11. Open questions
 
-- Профиль деградации приостановил PostgreSQL вручную (pause/unpause compose);
-  автоматизация - глобальные chaos-тесты 14.3.
-- Профиль деградации выявил и подтвердил дефект классификации (исправлен этим
-  коммитом): дедлайн на установлении соединения с PostgreSQL завершается на Linux
-  `os.ErrDeadlineExceeded` ("i/o timeout"), а не `context.DeadlineExceeded`.
-  Доказательство: сборка без исправления дала 34 из 301 неклассифицированных ответа,
-  с исправлением - 0 (повторный pre-fix эксперимент: 34, затем 0).
-  Попытка сузить классификацию проверкой `writeCtx.Err() != nil` оказалась
-  несостоятельной: дедлайн сокета срабатывает раньше, чем контекст успевает
-  зафиксировать истечение (9 из 301 в прогоне), поэтому i/o таймаут в write-пути
-  классифицируется как исчерпание бюджета по типу ошибки. В Handler единственный
-  внешний I/O - PostgreSQL, при появлении других сетевых вызовов классификацию
-  потребуется уточнить (зафиксировано в комментарии кода).
-- Глобальный смешанный профиль (14.1) включает долю вебхуков 5%; локальный порог
-  совместим.
-- Топик `gateway.webhooks.raw` создается сервисом `kafka-init` в compose (обнаружено
-  профилем: при `KAFKA_AUTO_CREATE_TOPICS_ENABLE=false` relay не мог публиковать).
+- The degradation profile paused PostgreSQL manually (compose pause/unpause); automation
+  is the global chaos tests 14.3.
+- The degradation profile revealed and confirmed a classification defect (fixed by this
+  commit): the deadline on establishing a connection to PostgreSQL expires on Linux as
+  `os.ErrDeadlineExceeded` ("i/o timeout"), not as `context.DeadlineExceeded`.
+  Evidence: a build without the fix produced 34 out of 301 unclassified responses, with
+  the fix - 0 (a repeated pre-fix experiment: 34, then 0).
+  An attempt to narrow the classification with a `writeCtx.Err() != nil` check turned out
+  to be unsound: the socket deadline fires before the context manages to record the
+  expiration (9 out of 301 in the run), so an i/o timeout in the write path is classified
+  as budget exhaustion by error type. In the Handler the only external I/O is PostgreSQL;
+  when other network calls appear, the classification will need to be refined (recorded
+  in a code comment).
+- The global mixed profile (14.1) includes a webhook share of 5%; the local threshold is
+  compatible.
+- The topic `gateway.webhooks.raw` is created by the `kafka-init` service in compose
+  (discovered by the profile: with `KAFKA_AUTO_CREATE_TOPICS_ENABLE=false` relay could
+  not publish).
 
-## 12. Ревью (CBL-001, шаг 6)
+## 12. Review (CBL-001, step 6)
 
-Четыре независимых прохода (14.10.2026). Блокеров нет. MAJOR архитектурного ревью
-(недостоверное объяснение дефекта классификации) закрыт повторным экспериментом:
-pre-fix сборка воспроизвела 34 неклассифицированных ответа, post-fix - 0; механизм
-уточнен (дедлайн dial на Linux дает `os.ErrDeadlineExceeded`; проверка состояния
-контекста не годится из-за гонки - 9 из 301), классификация по типу ошибки
-задокументирована. Остальные замечания закрыты правками скрипта, спеки и compose.
+Four independent passes (14.10.2026). No blockers. The MAJOR of the architectural review
+(an unreliable explanation of the classification defect) was closed by a repeated
+experiment: the pre-fix build reproduced 34 unclassified responses, the post-fix build -
+0; the mechanism was clarified (a dial deadline on Linux yields `os.ErrDeadlineExceeded`;
+a context state check is unsuitable because of a race - 9 out of 301), and the
+classification by error type is documented. The remaining findings were closed by fixes
+to the script, the spec and compose.
 
-| Роль | Ключевые замечания | Закрытие |
+| Role | Key findings | Closure |
 | :-- | :-- | :-- |
-| Без контекста | FR-1 описывал другой разгон; degraded проверял только наличие `Retry-After`; пороги dropped слабее заявленных; классификация шире бюджета; warn без `zap.Error`; kafka-init без зависимости у webhook-ingress; PowerShell-команды неполные | FR-1 приведен к скрипту; проверки `Retry-After: 1`, `write_timeout`, `status=accepted`, `duplicate=false`; пороги ужесточены; классификация задокументирована (гонка состояния контекста - 9/301); `zap.Error` добавлен; `depends_on kafka-init` добавлен, пустая строка; PowerShell-строка в шапке |
-| Архитектуры | MAJOR: объяснение причины дефекта не воспроизводилось, требовалась перепроверка pre-fix; warn без ошибки; transport знает про net/pgx (унаследовано); kafka-init без `service_completed_successfully`; шаг 7 процесса не сделан | эксперимент: pre-fix 34/301, post-fix 0/301; механизм уточнен в §11 и комментарии; `zap.Error`; классификация остается в transport осознанно (паттерн 5.2); зависимость добавлена; журнал/KI/AGENTS обновлены этим коммитом |
-| С контекстом | FR-1 против скрипта; kafka-init race; degraded dropped порог; отложенные шаг-7 обновления; дублирование тестового хендлера; формулировка §12; проверка `Retry-After`; 1 партиция против глобального каталога | все закрыты: спека, `depends_on`, пороги, AGENTS/CBL-004, `dialTimeoutHandler` переиспользован как блокирующий, §12 заполнен; headers/body проверяются; 1 партиция - осознанная конвенция локального стенда (как ledger) |
-| Безопасности | только NIT: pinning образов, `:ro` mount, дефолт секрета, широта классификации, значение `Retry-After` | секреты/kafka-init/compose/зависимости чисты; классификация сужена и покрыта тестом; `Retry-After: 1` проверяется; pinning и дефолт секрета - dev-конвенция (0.2/0.7) |
+| No context | FR-1 described a different ramp-up; degraded verified only the presence of `Retry-After`; the dropped thresholds were weaker than declared; the classification was wider than the budget; a warning without `zap.Error`; kafka-init without a dependency for webhook-ingress; the PowerShell commands were incomplete | FR-1 aligned with the script; checks of `Retry-After: 1`, `write_timeout`, `status=accepted`, `duplicate=false`; the thresholds tightened; the classification documented (context state race - 9/301); `zap.Error` added; `depends_on kafka-init` added, empty line; the PowerShell line in the header |
+| Architecture | MAJOR: the explanation of the defect cause was not reproducible, a pre-fix recheck was required; a warning without an error; transport knows about net/pgx (inherited); kafka-init without `service_completed_successfully`; step 7 of the process not done | experiment: pre-fix 34/301, post-fix 0/301; the mechanism clarified in section 11 and in a comment; `zap.Error`; the classification deliberately stays in transport (pattern 5.2); the dependency added; the journal/KI/AGENTS updated by this commit |
+| With context | FR-1 against the script; kafka-init race; the degraded dropped threshold; step-7 updates deferred; duplication of the test handler; wording of section 12; the `Retry-After` check; 1 partition against the global catalog | all closed: the spec, `depends_on`, the thresholds, AGENTS/CBL-004, `dialTimeoutHandler` reused as blocking, section 12 filled in; headers/body are checked; 1 partition is a deliberate local stand convention (like ledger) |
+| Security | only NITs: image pinning, `:ro` mount, the secret default, the breadth of the classification, the `Retry-After` value | secrets/kafka-init/compose/dependencies are clean; the classification narrowed and covered by a test; `Retry-After: 1` is checked; pinning and the secret default are a dev convention (0.2/0.7) |

@@ -1,125 +1,127 @@
 # AGENTS.md - cbl-webhook-ingress
 
-Прием вебхуков провайдера: проверка HMAC по сырому телу, inbox, быстрый ответ.
+Provider webhook intake: HMAC verification over the raw body, inbox, fast response.
 
-Обязательные глобальные правила: `../../AGENTS.md`, `../../.specs/CBL-001-development-process.md`,
-`../../.specs/CBL-002-repos-and-docker.md`, контракты `../../.specs/CBL-003-contracts.md`.
-Длинное тире (U+2014) запрещено, используется только дефис.
+Mandatory global rules: `../../AGENTS.md`, `../../.specs/CBL-001-development-process.md`,
+`../../.specs/CBL-002-repos-and-docker.md`, contracts `../../.specs/CBL-003-contracts.md`.
+The em dash (U+2014) is forbidden, only the hyphen is used.
 
-## 1. Границы
+## 1. Boundaries
 
-In scope: POST /hooks/{provider}/{endpoint_id}, HMAC, inbox, outbox в gateway.webhooks.raw.
+In scope: POST /hooks/{provider}/{endpoint_id}, HMAC, inbox, outbox to gateway.webhooks.raw.
 
-Out of scope: другие сервисы платформы; взаимодействие только через контракты `cbl-protos`
-(gRPC), Kafka и REST периметра (см. `CBL-000`, раздел 2).
+Out of scope: other platform services; interaction only through `cbl-protos` contracts
+(gRPC), Kafka and the perimeter REST (see `CBL-000`, section 2).
 
-## 2. Контракты
+## 2. Contracts
 
 - REST: POST /hooks/{provider}/{endpoint_id}
-- gRPC: нет
-- Kafka продюсирует: gateway.webhooks.raw
-- Kafka потребляет: нет
-- Хранилище: PostgreSQL webhook_ingress
+- gRPC: none
+- Kafka produces: gateway.webhooks.raw
+- Kafka consumes: none
+- Storage: PostgreSQL webhook_ingress
 
-Контракты заморожены в `cbl-protos` (CF-1 для gRPC, CF-2/CF-3 для событий), см. `CBL-004`.
+Contracts are frozen in `cbl-protos` (CF-1 for gRPC, CF-2/CF-3 for events), see `CBL-004`.
 
-## 3. Архитектура
+## 3. Architecture
 
-Слои: `internal/transport` -> `internal/usecase` -> `internal/domain` -> `internal/storage`.
-Библиотеки: стандартный набор `CBL-002` (Gin, GORM + pgx-драйвер, franz-go + pkg/sr, go-redis,
-goose, zap). `AutoMigrate` запрещен, миграции только goose, только вперед.
+Layers: `internal/transport` -> `internal/usecase` -> `internal/domain` -> `internal/storage`.
+Libraries: the standard set from `CBL-002` (Gin, GORM + pgx driver, franz-go + pkg/sr, go-redis,
+goose, zap). `AutoMigrate` is forbidden, migrations are goose-only, forward only.
 
-## 4. Команды
+## 4. Commands
 
-```powershell
+```sh
 make build        # go build ./...
 make test         # go test ./...
 make vet          # go vet ./...
-make lint         # golangci-lint в Docker
+make lint         # golangci-lint in Docker
 make up           # docker compose -f deploy/docker-compose.yml --profile app up -d --build
 make down         # docker compose -f deploy/docker-compose.yml down -v
 ```
 
-Нагрузочный прогон k6 (5.4): команды и профили burst/degraded - в шапке
-`test/load/webhook_burst.js` (прогоняются на compose-стенде).
+k6 load run (5.4): the commands and the burst/degraded profiles are in the header of
+`test/load/webhook_burst.js` (run against the compose stand).
+E2E runs follow the `test/e2e/E2E.md` instruction (scenario E2E_WebhookIngress_Kafka; artifacts in `test/e2e/.runs/<mark>/`); there are no PowerShell run scripts.
 
-## 5. Порты и окружение
+## 5. Ports and environment
 
-HTTP `8060`, gRPC `-`, метрики `9260`.
-Переменные (применимые к сервису): `HTTP_ADDR`, `GRPC_ADDR`, `METRICS_ADDR`, `PG_DSN`,
+HTTP `8060`, gRPC `-`, metrics `9260`.
+Variables (applicable to the service): `HTTP_ADDR`, `GRPC_ADDR`, `METRICS_ADDR`, `PG_DSN`,
 `KAFKA_BROKERS`, `SCHEMA_REGISTRY_URL`, `REDIS_ADDR`, `WEBHOOK_WRITE_TIMEOUT`
-(бюджет записи события, по умолчанию `450ms`, допустимо `100ms` - `5s`).
+(event write budget, default `450ms`, allowed `100ms` - `5s`).
 
-## 6. Правила разработки
+## 6. Development rules
 
-- Конвейер: SDD-спека в `.specs/` -> архитектура -> контракты -> тесты вперед -> код ->
-  ревью 4 агентами (без контекста, архитектура, контекст, безопасность - блокирующий) ->
-  AGENTS.md -> финальные прогоны -> линтеры -> коммит.
-- Покрытие unit+integration не ниже 80%; денежные сценарии только на реальных PostgreSQL и
-  Kafka (testcontainers); локальный e2e в docker-compose обязателен.
-- Деньги только int64 в минимальных единицах плюс decimals; float запрещен.
-- Docstring на русском в стиле godoc (первая строка с имени сущности, точка в конце);
-  комментарии объясняют почему; ошибки через `%w`; панки в бизнес-коде запрещены.
-- Коммит: `CBL-<эпик>.<номер>: <краткое сообщение>`, спека с тем же префиксом в том же коммите.
+- Pipeline: SDD spec in `.specs/` -> architecture -> contracts -> tests first -> code ->
+  review by 4 agents (no-context, architecture, with-context, security - blocking) ->
+  AGENTS.md -> final runs -> linters -> commit.
+- Unit+integration coverage is at least 80%; money scenarios only on real PostgreSQL and
+  Kafka (testcontainers); local e2e in docker-compose is mandatory.
+- Money only int64 in minor units plus decimals; float is forbidden.
+- Godoc docstrings are mandatory in English: the first line starts with the entity name and ends with a period; comments explain why; errors are wrapped with `%w`; panics in business code are forbidden.
+- Commit: `CBL-<epic>.<number>: <short message>`, the spec with the same prefix in the same commit.
 
-## 7. SLO и метрики
+## 7. SLO and metrics
 
-SLO уточняется в задаче 14.4. Базовые метрики: latency p95/p99, доля ошибок, outbox lag,
-consumer lag; дашборды после задачи 0.7.
+SLO is specified in task 14.4. Base metrics: latency p95/p99, error rate, outbox lag,
+consumer lag; dashboards after task 0.7.
 
 ## 8. Trade-offs
 
-| ID | Решение | Плюсы | Минусы и компенсация |
+| ID | Decision | Pros | Cons and compensation |
 | :-- | :-- | :-- | :-- |
-| T-WH-01 | Ответ дубликата расширен полем `duplicate` | клиенту видно повтор без повторного эффекта | расширение контракта | зафиксировано в CBL-5.1 FR-3 |
-| T-WH-02 | `event_id` - детерминированный UUIDv5 от provider и vendor id | дедупликация без таблицы соответствий, inbox требует UUID | vendor id обязан быть уникальным на каждое событие | зафиксировано в FR-4a 5.1; при переиспользовании id включить статус в ключ - решается с выбором шлюза (3.2, KI-01) |
-| T-WH-03 | В событие попадают только первые значения заголовков, чувствительные заголовки и заголовок подписи отброшены | безопасность и предсказуемость | многозначные заголовки теряются | политика определена в 5.1/5.2/5.3; список чувствительных заголовков расширяется вместе с провайдерами |
-| T-WH-04 | Бюджет записи `WEBHOOK_WRITE_TIMEOUT` (450 мс): при превышении транзакция прерывается, ответ `503` + `Retry-After: 1` | ответ не выходит за бюджет 500 мс при деградации PostgreSQL; провайдер повторяет | провоцирует повторы доставки под нагрузкой на БД | идемпотентность inbox исключает дубли (5.2 FR-1); порог проверяется нагрузкой 5.4 |
-| T-WH-05 | Allowlist шлюза по адресу TCP-пира (CIDR), proxy-заголовки не читаются | подделка `X-Forwarded-For` не обходит защиту; нет зависимости от схемы размещения | за прокси/балансировщиком адрес пира - адрес прокси, реальный адрес шлюза не различается | allowlist заполняется адресами LB; сетевые ограничения - 0.3 (NetworkPolicy/файрвол), ограничение доступа на транспортном уровне - 0.6 (mTLS там межсервисный, внешний шлюз отдельно); KI-webhook-ingress-04 |
-| T-WH-06 | Лимит приема на провайдера in-process (token bucket, без Redis) | критический путь записи не зависит от Redis (T-02/T-11); нулевые накладные расходы | при нескольких репликах лимит приблизительный (per-instance); bucket сбрасывается при деплое; токены расходуются до проверки подписи | агрегатная защита - сетевая (0.3: NetworkPolicy/файрвол, лимиты LB); периметр 7.5 вебхуки не видит; в prod allowlist обязателен (сканеры не исчерпают bucket легитимного шлюза); пересмотр при мультиреплике |
+| T-WH-01 | Duplicate response extended with the `duplicate` field | the client can see the repeat without a repeated effect | contract extension | recorded in CBL-5.1 FR-3 |
+| T-WH-02 | `event_id` is a deterministic UUIDv5 derived from provider and vendor id | deduplication without a mapping table, the inbox requires a UUID | the vendor id must be unique per event | recorded in FR-4a 5.1; if ids are reused, include the status in the key - to be decided together with the gateway choice (3.2, KI-01) |
+| T-WH-03 | Only the first header values are included in the event; sensitive headers and the signature header are dropped | security and predictability | multi-value headers are lost | the policy is defined in 5.1/5.2/5.3; the sensitive header list grows together with providers |
+| T-WH-04 | Write budget `WEBHOOK_WRITE_TIMEOUT` (450 ms): when exceeded, the transaction is aborted, response `503` + `Retry-After: 1` | the response stays within the 500 ms budget under PostgreSQL degradation; the provider retries | provokes delivery retries under DB load | inbox idempotency excludes duplicates (5.2 FR-1); the threshold is verified by the 5.4 load test |
+| T-WH-05 | Gateway allowlist by TCP peer address (CIDR), proxy headers are not read | `X-Forwarded-For` spoofing does not bypass the protection; no dependency on the deployment scheme | behind a proxy/load balancer the peer address is the proxy address, the real gateway address is not distinguishable | the allowlist is filled with LB addresses; network restrictions - 0.3 (NetworkPolicy/firewall), transport-level access restriction - 0.6 (mTLS there is inter-service, the external gateway is separate); KI-webhook-ingress-04 |
+| T-WH-06 | Per-provider intake limit in-process (token bucket, no Redis) | the critical write path does not depend on Redis (T-02/T-11); zero overhead | with multiple replicas the limit is approximate (per-instance); the bucket resets on deploy; tokens are consumed before signature verification | aggregate protection is network-level (0.3: NetworkPolicy/firewall, LB limits); the 7.5 perimeter does not see webhooks; in prod the allowlist is mandatory (scanners will not exhaust the legitimate gateway bucket); revisit with multiple replicas |
 
 ## 9. Known issues
 
-| ID | Проблема | Влияние | План | Статус |
+| ID | Problem | Impact | Plan | Status |
 | :-- | :-- | :-- | :-- | :-- |
-| KI-webhook-ingress-01 | CI и pre-commit не настроены | линтеры запускаются вручную | задача 0.2 | open |
-| KI-webhook-ingress-02 | Нагрузочный профиль (5.4) не написан | порог p99 менее 500 мс не подтвержден; поведение при деградации БД (retry-шторм 503, T-WH-04) не измерено | ЗАКРЫТ 14.10.2026: `test/load/webhook_burst.js`, профили burst (p99 25.36 мс, 0 ошибок) и degraded (100% 503 + Retry-After, p99 459.7 мс); найден и исправлен дефект классификации `os.ErrDeadlineExceeded` | closed |
-| KI-webhook-ingress-03 | traceparent не пробрасывается в конверт события | сквозная трассировка асинхронного звена неполная | задача 0.7 | open |
-| KI-webhook-ingress-04 | За прокси/балансировщиком allowlist видит адрес прокси, а не шлюза; реальный адрес клиента не проверяется | защита ослаблена, если LB доступен извне | прямой прием в prod; при появлении LB - allowlist по адресам LB плюс сетевые ограничения (0.3) и ограничение доступа к шлюзу (0.6) | open |
+| KI-webhook-ingress-01 | CI and pre-commit are not configured | linters are run manually | task 0.2 | open |
+| KI-webhook-ingress-02 | The load profile (5.4) is not written | the p99 threshold below 500 ms is not confirmed; behavior under DB degradation (503 retry storm, T-WH-04) is not measured | CLOSED 14.10.2026: `test/load/webhook_burst.js`, burst profile (p99 25.36 ms, 0 errors) and degraded profile (100% 503 + Retry-After, p99 459.7 ms); the `os.ErrDeadlineExceeded` classification defect was found and fixed | closed |
+| KI-webhook-ingress-03 | traceparent is not propagated into the event envelope | end-to-end tracing of the asynchronous link is incomplete | task 0.7 | open |
+| KI-webhook-ingress-04 | Behind a proxy/load balancer the allowlist sees the proxy address, not the gateway; the real client address is not verified | protection is weakened if the LB is reachable from outside | direct intake in prod; when an LB appears - allowlist by LB addresses plus network restrictions (0.3) and gateway access restriction (0.6) | open |
 
-## 10. Журнал задач
+## 10. Task journal
 
-| CBL | Дата | Статус | Спека | Коммит |
+| CBL | Date | Status | Spec | Commit |
 | :-- | :-- | :-- | :-- | :-- |
-| CBL-5.1 | 2026-10-14 | done, ревью закрыто (HMAC-эндпоинт, allowlist, e2e с Kafka, покрытие 84.5%) | `.specs/CBL-5.1-hmac-endpoint.md` | 73e1dbd |
-| CBL-5.2 | 2026-10-14 | done, ревью закрыто (конкурентная идемпотентность, бюджет записи 450 мс с 503, инварианты конверта) | `.specs/CBL-5.2-inbox-outbox.md` | f3d567a |
-| CBL-5.3 | 2026-10-14 | done, ревью закрыто (allowlist IP пира, лимит приема in-process, порядок проверок) | `.specs/CBL-5.3-protection.md` | 404c665 |
-| CBL-5.4 | 2026-10-14 | done, ревью закрыто (k6 профили burst/degraded, p99 30.66 мс; fix классификации os.ErrDeadlineExceeded; kafka-init на стенде) | `.specs/CBL-5.4-load.md` | этот коммит |
+| CBL-5.1 | 2026-10-14 | done, review closed (HMAC endpoint, allowlist, e2e with Kafka, coverage 84.5%) | `.specs/CBL-5.1-hmac-endpoint.md` | 73e1dbd |
+| CBL-5.2 | 2026-10-14 | done, review closed (concurrent idempotency, 450 ms write budget with 503, envelope invariants) | `.specs/CBL-5.2-inbox-outbox.md` | f3d567a |
+| CBL-5.3 | 2026-10-14 | done, review closed (peer IP allowlist, in-process intake limit, check order) | `.specs/CBL-5.3-protection.md` | 404c665 |
+| CBL-5.4 | 2026-10-14 | done, review closed (k6 burst/degraded profiles, p99 30.66 ms; os.ErrDeadlineExceeded classification fix; kafka-init on the stand) | `.specs/CBL-5.4-load.md` | 299002e |
+| CBL-16.11 | 2026-10-16 | done (English comments and documentation across the repository: code, tests, configs, all four specs, AGENTS.md, README; e2e runs via `test/e2e/E2E.md` with scenario E2E_WebhookIngress_Kafka; validation run PASS; coverage unchanged) | `.specs/CBL-16.11-conventions.md` | this commit |
 
 ## 11. Runbook
 
-Заполняется первой продуктовой задачей сервиса. Типовые аварии: недоступность зависимости,
-рост ошибок, лаг обработки; действия: проверить health/metrics, логи с request_id, состояние
-Kafka consumer group и outbox lag, при необходимости перезапустить сервис.
+Filled in by the first product task of the service. Typical incidents: dependency
+unavailability, error growth, processing lag; actions: check health/metrics, logs with
+request_id, the state of the Kafka consumer group and outbox lag, restart the service if needed.
 
-Прием вебхуков (5.2):
+Webhook intake (5.2):
 
-1. Ответы `503 write_timeout`: PostgreSQL не укладывается в `WEBHOOK_WRITE_TIMEOUT`
-   (логи `webhook write budget exceeded`); провайдер повторит доставку, дублей не будет.
-   Действия: проверить нагрузку на БД и пул соединений, при устойчивой деградации поднять
-   бюджет в пределах 5 с.
-2. `duplicate=true` в ответе: повторная доставка уже принятого события; действий не
-   требуется, событие публикуется один раз.
-3. Outbox растет, события не публикуются: проверить `KAFKA_BROKERS` и логи relay kit;
-   при пустом `KAFKA_BROKERS` relay выключен (в логе предупреждение).
+1. `503 write_timeout` responses: PostgreSQL does not fit into `WEBHOOK_WRITE_TIMEOUT`
+   (logs `webhook write budget exceeded`); the provider will redeliver, there will be no
+   duplicates. Actions: check the DB load and the connection pool; under sustained
+   degradation raise the budget within 5 s.
+2. `duplicate=true` in the response: a redelivery of an already accepted event; no action
+   is required, the event is published once.
+3. The outbox grows, events are not published: check `KAFKA_BROKERS` and the cbl-kit relay
+   logs; with an empty `KAFKA_BROKERS` the relay is disabled (a warning in the log).
 
-Защита приема (5.3):
+Intake protection (5.3):
 
-1. Ответы `403 ip_forbidden`: адрес пира вне `ip_allowlist` провайдера (лог
-   `webhook source rejected` с `remote_addr`); при легитимной смене адреса шлюза обновить
-   allowlist; за LB помнить, что адрес пира - адрес LB (KI-webhook-ingress-04).
-2. Ответы `429 rate_limited` (лог `webhook rate limited`): всплеск доставки превысил
-   `rate_rps`/`rate_burst`; проверить, не дублирует ли провайдер события (дубликаты
-   безопасны, но расходуют токены), и при устойчивом легитимном трафике поднять лимит.
-3. Пустой `ip_allowlist` у провайдера: dev-режим, принимаются любые адреса; в prod
-   заполнять (KI-webhook-ingress-04).
+1. `403 ip_forbidden` responses: the peer address is outside the provider `ip_allowlist`
+   (log `webhook source rejected` with `remote_addr`); on a legitimate gateway address
+   change update the allowlist; behind an LB remember that the peer address is the LB
+   address (KI-webhook-ingress-04).
+2. `429 rate_limited` responses (log `webhook rate limited`): a delivery burst exceeded
+   `rate_rps`/`rate_burst`; check whether the provider duplicates events (duplicates are
+   safe but consume tokens), and under sustained legitimate traffic raise the limit.
+3. Empty `ip_allowlist` for a provider: dev mode, any addresses are accepted; in prod
+   fill it in (KI-webhook-ingress-04).

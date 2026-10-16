@@ -1,112 +1,115 @@
-# CBL-5.1. Эндпоинт вебхуков с проверкой HMAC
+# CBL-5.1. Webhook endpoint with HMAC verification
 
-| Поле | Значение |
+| Field | Value |
 | :-- | :-- |
-| Эпик | E5, Webhook Ingress |
-| Репозиторий | `cbl-webhook-ingress` |
-| Размер | M |
-| Волна и параллельная группа | W1-WEBHOOK |
-| Зависит от | 1.6 (cbl-kit/hmac), CF-1 |
-| Версия контрактов | `cbl-protos@cf-1` (`billing/events/v1`), `CBL-003` раздел 4 |
-| Статус | done (локально, ожидает коммита) |
+| Epic | E5, Webhook Ingress |
+| Repository | `cbl-webhook-ingress` |
+| Size | M |
+| Wave and parallel group | W1-WEBHOOK |
+| Depends on | 1.6 (cbl-kit/hmac), CF-1 |
+| Contract version | `cbl-protos@cf-1` (`billing/events/v1`), `CBL-003` section 4 |
+| Status | done (locally, awaiting commit) |
 
-## 1. Контекст и цель
+## 1. Context and goal
 
-Сервис принимает вебхуки провайдера, проверяет подпись по сырому телу, фиксирует событие в
-inbox и публикует его в `gateway.webhooks.raw` через outbox, отвечая быстро (цель до 500 мс).
-Это первый рубеж защиты денежного контура от поддельных событий.
+The service accepts provider webhooks, verifies the signature over the raw body, persists the
+event in the inbox and publishes it to `gateway.webhooks.raw` via the outbox, responding
+quickly (target up to 500 ms). This is the first line of defense of the money circuit against
+forged events.
 
-## 2. Границы
+## 2. Boundaries
 
-In scope: маршрут `POST /hooks/{provider}/{endpoint_id}`, чтение сырого тела, HMAC-проверка,
-inbox по id события, outbox-публикация, защита лимитов.
-Out of scope: нормализация событий (3.5 Connector), темы и схемы (CF-1), allowlist IP (5.3).
+In scope: the route `POST /hooks/{provider}/{endpoint_id}`, raw body reading, HMAC verification,
+inbox by event id, outbox publication, limit protection.
+Out of scope: event normalization (3.5 Connector), topics and schemas (CF-1), IP allowlist (5.3).
 
-## 3. Функциональные требования
+## 3. Functional requirements
 
-FR-1. `POST /hooks/{provider}/{endpoint_id}`: тело читается как сырые байты, предел 1 МБ
-(`http.MaxBytesReader`), сигнатура проверяется через `cbl-kit/hmac` до любого разбора JSON.
+FR-1. `POST /hooks/{provider}/{endpoint_id}`: the body is read as raw bytes, the limit is 1 MB
+(`http.MaxBytesReader`), the signature is verified via `cbl-kit/hmac` before any JSON parsing.
 
-FR-2. Заголовки подписи конфигурируются на провайдера: имя заголовка подписи, имя заголовка
-id события и необязательный allowlist endpoint_id (`WEBHOOK_PROVIDERS` JSON в env:
-`{provider: {signature_header, event_id_header, secret_env, endpoints?}}`). Пустой `endpoints`
-разрешает любой endpoint_id; непустой - только перечисленные. Секреты только из env/Vault,
-в логах не появляются.
+FR-2. Signature headers are configured per provider: the signature header name, the event id
+header name, and an optional endpoint_id allowlist (`WEBHOOK_PROVIDERS` JSON in env:
+`{provider: {signature_header, event_id_header, secret_env, endpoints?}}`). An empty `endpoints`
+allows any endpoint_id; a non-empty one allows only the listed ones. Secrets come only from
+env/Vault and never appear in logs.
 
-FR-3. Успех: в одной транзакции PostgreSQL запись inbox `(consumer=provider, event_id)` и
-строка outbox с конвертом `gateway.webhooks.raw` (поля `GatewayWebhookRaw`: provider,
-gateway_id, received_at, headers без чувствительных заголовков, raw_body,
-signature_verified=true); ответ `200 {"status": "accepted", "duplicate": <bool>}` до ~500 мс
-без ожидания Kafka (поле duplicate показывает распознанный повтор).
+FR-3. Success: in a single PostgreSQL transaction, an inbox record `(consumer=provider, event_id)`
+and an outbox row with the `gateway.webhooks.raw` envelope (`GatewayWebhookRaw` fields: provider,
+gateway_id, received_at, headers without sensitive headers, raw_body, signature_verified=true);
+the response `200 {"status": "accepted", "duplicate": <bool>}` within ~500 ms without waiting for
+Kafka (the duplicate field shows a recognized duplicate).
 
-FR-4. Проверка подписи выполняется до валидации заголовков события (единый `401` для
-неаутентифицированных запросов). Дубликат `event_id` (inbox conflict) - `200` без повторной
-публикации. Тело больше лимита - `413`. Неизвестный provider или незарегистрированный
-endpoint_id - `404`. Невалидный JSON после проверки подписи не влияет на прием: тело
-сохраняется как есть. Если `gateway_id` не найден в теле, ключ партиции строится по
-endpoint_id, а поле `gateway_id` конверта получает значение `unknown` (уточнение в 3.5).
+FR-4. Signature verification is performed before event header validation (a single `401` for
+unauthenticated requests). A duplicate `event_id` (inbox conflict) is `200` without
+re-publication. A body over the limit is `413`. An unknown provider or an unregistered
+endpoint_id is `404`. Invalid JSON after signature verification does not affect acceptance: the
+body is stored as is. If `gateway_id` is not found in the body, the partition key is built from
+endpoint_id, and the envelope `gateway_id` field gets the value `unknown` (clarification in 3.5).
 
-FR-4a. Событие без id в заголовках отклоняется `422` (идемпотентность невозможна).
-Для inbox `event_id` детерминированно выводится как UUIDv5 (`uuid.NewSHA1`) из
-`"cbl-webhook:" + provider + ":" + vendor_event_id`: повторная доставка провайдером
-распознается без внешней таблицы соответствий, при этом выполняется требование inbox к UUID.
+FR-4a. An event without an id in the headers is rejected with `422` (idempotency is impossible).
+For the inbox, `event_id` is deterministically derived as UUIDv5 (`uuid.NewSHA1`) from
+`"cbl-webhook:" + provider + ":" + vendor_event_id`: a repeated delivery by the provider is
+recognized without an external mapping table, while the inbox UUID requirement is satisfied.
 
-FR-5. Публикация в Kafka выполняется relay из `cbl-kit/outbox` (фоновая горутина), метрики
-outbox lag подключаются в 0.7.
+FR-5. Publication to Kafka is performed by the relay from `cbl-kit/outbox` (a background
+goroutine); outbox lag metrics are connected in 0.7.
 
-FR-6. Локальные зависимости: `replace` на `../cbl-kit` и `../cbl-protos` (см. `CBL-2.1`, FR-7).
+FR-6. Local dependencies: `replace` directives to `../cbl-kit` and `../cbl-protos` (see
+`CBL-2.1`, FR-7).
 
-## 4. Контракты
+## 4. Contracts
 
-Топик `gateway.webhooks.raw`, ключ `provider+gateway_id`, конверт и заголовки - `CBL-003`
-раздел 6; proto `billing/events/v1/GatewayWebhookRaw`.
+The topic `gateway.webhooks.raw`, the key `provider+gateway_id`, the envelope and headers are in
+`CBL-003` section 6; proto `billing/events/v1/GatewayWebhookRaw`.
 
-## 5. Модель данных и миграции
+## 5. Data model and migrations
 
-`migrations/00001_outbox.sql` и `00002_inbox.sql` - копии reference-DDL из `cbl-kit`.
+`migrations/00001_outbox.sql` and `00002_inbox.sql` are copies of the reference DDL from
+`cbl-kit`.
 
-## 6. Конечные автоматы
+## 6. State machines
 
-Не применимо; статусы платежа меняет Payment по каноническим событиям.
+Not applicable; payment statuses are changed by Payment based on canonical events.
 
 ## 7. Edge cases
 
-Пустое тело, невалидный hex, timestamp вне окна +/- 5 минут (replay), несколько подписей
-(ротация секрета), неизвестный endpoint_id, дубликат события, конкурентные дубликаты
-(уникальный ключ inbox), медленный PostgreSQL (ответ деградирует, но 200 не гарантируется).
+Empty body, invalid hex, timestamp outside the +/- 5 minute window (replay), multiple signatures
+(secret rotation), unknown endpoint_id, duplicate event, concurrent duplicates (unique inbox
+key), slow PostgreSQL (the response degrades, but 200 is not guaranteed).
 
-## 8. Нефункциональные требования
+## 8. Non-functional requirements
 
-p99 ответа менее 500 мс при всплеске (5.4); сервис не разбирает JSON до проверки подписи;
-сырое тело не логируется (только размер и event_id); секреты не попадают в логи и трейсы.
+Response p99 under 500 ms under burst (5.4); the service does not parse JSON before signature
+verification; the raw body is not logged (only its size and event_id); secrets never reach logs
+or traces.
 
-## 9. План тестов
+## 9. Test plan
 
-| Уровень | Сценарии |
+| Level | Scenarios |
 | :-- | :-- |
 | Smoke | `go build ./...`, `/healthz` |
-| Unit | httptest: валидная подпись, неверная подпись, просроченный timestamp, отсутствие id, большой body, неизвестный provider (пути без БД через интерфейсы) |
-| Integration | testcontainers PostgreSQL: inbox+outbox в одной транзакции; дубликат не публикует повторно; relay отправляет событие (recording publisher) |
-| E2E | подписанный вебхук -> PostgreSQL (inbox/outbox) -> Kafka; реализован на testcontainers (`test/e2e`), отклонение от буквального compose зафиксировано в CBL-004 |
-| Load | профиль 5.4: p99 менее 500 мс |
+| Unit | httptest: valid signature, invalid signature, expired timestamp, missing id, large body, unknown provider (DB-less paths via interfaces) |
+| Integration | testcontainers PostgreSQL: inbox+outbox in a single transaction; a duplicate does not re-publish; the relay sends the event (recording publisher) |
+| E2E | signed webhook -> PostgreSQL (inbox/outbox) -> Kafka; implemented on testcontainers (`test/e2e`), the deviation from the literal compose is recorded in CBL-004 |
+| Load | profile 5.4: p99 under 500 ms |
 
-## 10. План работ и коммит
+## 10. Work plan and commit
 
-Коммит `CBL-5.1: эндпоинт вебхуков с HMAC и inbox`; спека в том же коммите.
+Commit `CBL-5.1: webhook endpoint with HMAC and inbox`; the spec is in the same commit.
 
-## 11. Открытые вопросы
+## 11. Open questions
 
-- Список провайдеров и формат их подписей фиксируется вместе с выбором шлюза (KI-01);
-  до этого используется конфигурация mock-провайдера.
+- The provider list and their signature formats are fixed together with the gateway choice
+  (KI-01); until then, the mock provider configuration is used.
 
-## 12. Ревью (CBL-001, шаг 6)
+## 12. Review (CBL-001, step 6)
 
-Четыре независимых прохода (13 - 14.10.2026); blocker не найден, major закрыты.
+Four independent passes (13 - 14.10.2026); no blocker found, majors closed.
 
-| Роль | Ключевые замечания | Закрытие |
+| Role | Key findings | Closure |
 | :-- | :-- | :-- |
-| Без контекста | нет 404 для неизвестного `endpoint_id`; формула UUIDv5 отличалась от спеки; поле `duplicate` не описано; отсутствовал e2e | allowlist `endpoints` в конфиге провайдера + тест; FR-4a приведена к коду; FR-3 дополнена полем `duplicate`; e2e (подписанный вебхук -> PostgreSQL -> Kafka) добавлен и выполнен |
-| Архитектуры | `gateway_id=unknown` - скрытое допущение; нет `traceparent` в конверте | допущение зафиксировано (фолбэк на endpoint), traceparent запланирован на 0.7 (KI) |
-| С контекстом | отсутствие relay-теста; пустой e2e-каталог | relay-тест добавлен; e2e реализован |
-| Безопасности | проверка `event_id` до подписи давала различимые ответы; все заголовки сохранялись в событие | проверки переупорядочены (подпись первой), чувствительные заголовки отфильтрованы, добавлены таймауты чтения/записи, уязвимые зависимости обновлены |
-
+| No context | no 404 for an unknown `endpoint_id`; the UUIDv5 formula differed from the spec; the `duplicate` field was not described; e2e was missing | the `endpoints` allowlist in the provider config + test; FR-4a aligned with the code; FR-3 extended with the `duplicate` field; e2e (signed webhook -> PostgreSQL -> Kafka) added and executed |
+| Architecture | `gateway_id=unknown` is a hidden assumption; no `traceparent` in the envelope | the assumption is recorded (fallback to endpoint), traceparent is planned for 0.7 (KI) |
+| With context | missing relay test; empty e2e directory | relay test added; e2e implemented |
+| Security | the `event_id` check before the signature produced distinguishable responses; all headers were stored in the event | the checks were reordered (signature first), sensitive headers are filtered out, read/write timeouts added, vulnerable dependencies updated |

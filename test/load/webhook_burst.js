@@ -1,14 +1,14 @@
-// Нагрузочный сценарий CBL-5.4: всплеск вебхуков и деградация PostgreSQL.
-// Пороги: p99 ответа менее 500 мс, 5xx отсутствуют (CBL-002, раздел 8).
+// Load scenario CBL-5.4: webhook burst and PostgreSQL degradation.
+// Thresholds: response p99 below 500 ms, no 5xx (CBL-002, section 8).
 //
-// Команды (cmd.exe, из каталога services/cbl-webhook-ingress):
+// Commands (cmd.exe, from the services/cbl-webhook-ingress directory):
 //   docker compose -f deploy/docker-compose.yml --profile app up -d --build
 //   docker run --rm -i -v "%CD%/test/load":/scripts grafana/k6:2.3.0 run /scripts/webhook_burst.js
-// Профиль деградации (503 + Retry-After при приостановленном PostgreSQL):
+// Degraded profile (503 + Retry-After with PostgreSQL paused):
 //   docker compose -f deploy/docker-compose.yml pause postgres
 //   docker run --rm -i -v "%CD%/test/load":/scripts -e PROFILE=degraded grafana/k6:2.3.0 run /scripts/webhook_burst.js
 //   docker compose -f deploy/docker-compose.yml unpause postgres
-// PowerShell: те же команды, %CD% заменяется на $PWD (например, -v "$PWD/test/load":/scripts).
+// PowerShell: the same commands with %CD% replaced by $PWD (for example, -v "$PWD/test/load":/scripts).
 import http from 'k6/http';
 import crypto from 'k6/crypto';
 import { check } from 'k6';
@@ -19,12 +19,12 @@ const url = __ENV.WEBHOOK_URL || 'http://host.docker.internal:8060/hooks/mock/ep
 const secret = __ENV.WEBHOOK_SECRET || 'mock-secret';
 const burstRate = Number(__ENV.RATE || 500);
 const degradedRate = Number(__ENV.DEGRADED_RATE || 20);
-// Уникальный префикс запуска: повторный прогон не является replay (окно HMAC +/- 5 минут).
+// Unique run prefix: a repeated run is not a replay (HMAC window +/- 5 minutes).
 const runID = __ENV.RUN_ID || `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 
-// server_errors фиксирует 5xx (ожидаемые 503 в профиле деградации видны отдельно),
-// rate_limited - срабатывания лимита приема (в профиле всплеска их быть не должно),
-// unexpected_responses - ответы, не соответствующие ожиданию профиля.
+// server_errors records 5xx responses (expected 503s in the degraded profile are visible separately),
+// rate_limited - intake limit hits (there must be none in the burst profile),
+// unexpected_responses - responses that do not match the profile expectation.
 const serverErrors = new Counter('server_errors');
 const rateLimited = new Counter('rate_limited');
 const unexpectedResponses = new Counter('unexpected_responses');

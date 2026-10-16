@@ -1,143 +1,152 @@
-# CBL-5.3. Защита: лимиты и allowlist IP шлюза
+# CBL-5.3. Protection: rate limits and gateway IP allowlist
 
-| Поле | Значение |
+| Field | Value |
 | :-- | :-- |
-| Эпик | E5, Webhook Ingress |
-| Репозиторий | `cbl-webhook-ingress` |
-| Размер | S |
-| Волна и параллельная группа | W1-WEBHOOK |
-| Зависит от | 5.1, 5.2 |
-| Версия контрактов | `cbl-protos@cf-1`, `CBL-003` разделы 4, 7 |
-| Статус | done, ревью закрыто |
+| Epic | E5, Webhook Ingress |
+| Repository | `cbl-webhook-ingress` |
+| Size | S |
+| Wave and parallel group | W1-WEBHOOK |
+| Depends on | 5.1, 5.2 |
+| Contract version | `cbl-protos@cf-1`, `CBL-003` sections 4, 7 |
+| Status | done, review closed |
 
-## 1. Контекст и цель
+## 1. Context and goal
 
-Webhook Ingress - интернет-обращенный сервис: вебхуки приходят напрямую от шлюза, минуя
-периметр API Gateway (`CBL-000`, раздел 2). Задача добавляет сетевую защиту: allowlist
-адресов шлюза на уровне приложения и лимиты приема на провайдера, а также фиксирует
-контракт отдельного развертывания (собственный workload, изоляция сетью).
+Webhook Ingress is an internet-facing service: webhooks arrive directly from the gateway,
+bypassing the API Gateway perimeter (`CBL-000`, section 2). This task adds network
+protection: an application-level allowlist of gateway addresses and per-provider intake
+rate limits, and records the contract of a separate deployment (its own workload, network
+isolation).
 
-## 2. Границы
+## 2. Boundaries
 
-In scope: `ip_allowlist` провайдера (CIDR), отказ `403`; лимит приема per provider
-(token bucket, отказ `429` с `Retry-After`); запрет доверия proxy-заголовкам;
-фиксация отдельного развертывания.
-Out of scope: TLS-терминация и mTLS (0.6), K8s NetworkPolicy (0.3), WAF периметра,
-метрики лимитов (0.7), HMAC (5.1), бюджет записи (5.2).
+In scope: provider `ip_allowlist` (CIDR), rejection with `403`; per-provider intake limit
+(token bucket, rejection with `429` plus `Retry-After`); refusal to trust proxy headers;
+recording of the separate deployment.
 
-## 3. Функциональные требования
+Out of scope: TLS termination and mTLS (0.6), K8s NetworkPolicy (0.3), perimeter WAF,
+rate limit metrics (0.7), HMAC (5.1), write budget (5.2).
 
-FR-1. Конфигурация провайдера расширяется полями `WEBHOOK_PROVIDERS`:
-`ip_allowlist` - массив CIDR (`10.0.0.0/8`) или одиночных адресов (трактуются как /32,
-/128); пустой список разрешает любые адреса (dev-режим, в лог пишется предупреждение
-`provider ip allowlist is empty`); невалидный элемент - сервис не стартует. `rate_rps` -
-устойчивая скорость приема в секунду (0 - без ограничения), `rate_burst` - вместимость
-всплеска (0 - нормализуется в `rate_rps`). Пределы: до 64 записей allowlist,
-`rate_rps` 1 - 100 000, `rate_burst` 1 - 1 000 000; нарушение - ошибка конфигурации.
-`rate_burst` при `rate_rps = 0` - ошибка (лимит задается парой).
+## 3. Functional requirements
 
-FR-2. Проверка адреса: сравнивается адрес TCP-пира (`RemoteAddr`), а не заголовки
-`X-Forwarded-For`/`X-Real-IP`: доверять proxy-заголовкам при прямом приеме нельзя
-(подделка адреса). Проверка выполняется после разрешения провайдера и до чтения тела;
-отказ - `403 application/problem+json` без деталей. Неразбираемый `RemoteAddr` при
-заданном allowlist - отказ (fail-closed).
+FR-1. The provider configuration is extended with `WEBHOOK_PROVIDERS` fields:
+`ip_allowlist` - an array of CIDRs (`10.0.0.0/8`) or single addresses (treated as /32,
+/128); an empty list allows any address (dev mode, a warning
+`provider ip allowlist is empty` is written to the log); an invalid element means the
+service does not start. `rate_rps` - the sustained intake rate per second (0 - no limit),
+`rate_burst` - the burst capacity (0 - normalized to `rate_rps`). Limits: up to 64
+allowlist entries, `rate_rps` 1 - 100 000, `rate_burst` 1 - 1 000 000; a violation is a
+configuration error. `rate_burst` with `rate_rps = 0` is an error (the limit is defined as
+a pair).
 
-FR-3. Лимит приема на провайдера: потокобезопасный token bucket с ленивым пополнением
-(без фоновых горутин): устойчивая скорость `rate_rps`, всплеск `rate_burst`. Один запрос
-расходует один токен; при исчерпании - `429 application/problem+json` c `Retry-After: 1`
-до чтения тела и проверки подписи. Лимит in-process: критический путь записи не зависит
-от Redis (T-02, T-11), при нескольких репликах лимит является приблизительным
-(агрегатный - периметр, 7.5).
+FR-2. Address check: the TCP peer address (`RemoteAddr`) is compared, not the
+`X-Forwarded-For`/`X-Real-IP` headers: proxy headers must not be trusted on direct intake
+(address spoofing). The check is performed after provider resolution and before reading
+the body; a rejection is `403 application/problem+json` without details. An unparsable
+`RemoteAddr` with a configured allowlist is a rejection (fail-closed).
 
-FR-4. Порядок проверок в обработчике: провайдер (`404`) -> allowlist (`403`) ->
-endpoint (`404`) -> лимит (`429`) -> размер тела (`413`) -> подпись (`401`) ->
-event id (`422`) -> запись (`503`/`408`/`500`/`200`). Allowlist стоит до проверки
-endpoint, чтобы чужой адрес не мог отличить существующий endpoint от несуществующего.
+FR-3. Per-provider intake limit: a thread-safe token bucket with lazy refill (no
+background goroutines): sustained rate `rate_rps`, burst `rate_burst`. One request
+consumes one token; on exhaustion - `429 application/problem+json` with `Retry-After: 1`
+before reading the body and verifying the signature. The limit is in-process: the
+critical write path does not depend on Redis (T-02, T-11); with several replicas the
+limit is approximate (aggregate protection is the perimeter, 7.5).
 
-FR-5. Отдельное развертывание: сервис разворачивается отдельным workload (локально -
-отдельный сервис compose, prod - отдельный Deployment, шаблон 0.3) и принимает трафик
-шлюза напрямую; сетевой доступ ограничивается allowlist приложения, а на периметре -
-NetworkPolicy/файрволом по адресам шлюза (задачи 0.3, 0.6). Публичные листенеры
-`/healthz`, `/readyz` (8060) и `/metrics` (9260) наружу не публикуются; их изоляция
-входит в шаблон 0.3. Сервис не размещается за общим rate limit контуром мерчантов:
-трафик шлюза не проходит периметр API Gateway (7.5), поэтому агрегатная защита -
-сетевая (0.3).
+FR-4. Order of checks in the handler: provider (`404`) -> allowlist (`403`) ->
+endpoint (`404`) -> limit (`429`) -> body size (`413`) -> signature (`401`) ->
+event id (`422`) -> write (`503`/`408`/`500`/`200`). The allowlist comes before the
+endpoint check so that a foreign address cannot tell an existing endpoint from a
+nonexistent one.
 
-## 4. Контракты
+FR-5. Separate deployment: the service is deployed as a separate workload (locally a
+separate compose service, in prod a separate Deployment, template 0.3) and accepts
+gateway traffic directly; network access is restricted by the application allowlist, and
+at the perimeter by NetworkPolicy/firewall over the gateway addresses (tasks 0.3, 0.6).
+The public listeners `/healthz`, `/readyz` (8060) and `/metrics` (9260) are not exposed
+outward; their isolation is part of template 0.3. The service is not placed behind the
+shared merchant rate limit circuit: gateway traffic does not pass the API Gateway
+perimeter (7.5), so aggregate protection is network-level (0.3).
 
-HTTP-контракт дополняется `403` и `429` (оба `application/problem+json`); `429` несет
-`Retry-After: 1`. Конверт и топики не меняются. Конфигурация - расширение
-`WEBHOOK_PROVIDERS` (обратно совместимо: новые поля необязательны).
+## 4. Contracts
 
-## 5. Модель данных и миграции
+The HTTP contract is extended with `403` and `429` (both `application/problem+json`);
+`429` carries `Retry-After: 1`. The envelope and topics do not change. The configuration
+is an extension of `WEBHOOK_PROVIDERS` (backward compatible: the new fields are
+optional).
 
-Новых таблиц и миграций нет: лимиты и allowlist - конфигурация процесса.
+## 5. Data model and migrations
 
-## 6. Конечные автоматы
+No new tables or migrations: the limits and the allowlist are process configuration.
 
-Не применимо.
+## 6. State machines
+
+Not applicable.
 
 ## 7. Edge cases
 
-Пустой allowlist (dev, предупреждение в лог); IPv4, IPv6 и одиночные адреса; подсеть
-верхнего уровня `0.0.0.0/0` (разрешает все IPv4-адреса; для IPv6 нужен отдельный
-`::/0`); IPv4-mapped подсети (`::ffff:a.b.c.d/nn`) нормализуются к IPv4; `RemoteAddr`
-без порта, с зоной IPv6 (отказ) или неразбираемый (отказ); подделка `X-Forwarded-For`
-при запрещенном пире (не помогает); `rate_rps=0` (лимит выключен); `rate_burst=0`
-(нормализуется в rps); исчерпание всплеска; возврат токенов по времени; конкурентные
-запросы к bucket; лимит и allowlist вместе; запрос отклонен до чтения тела и до
-проверки подписи (тесты: сверхбольшое тело и отсутствующая подпись при отказе по
-адресу/лимиту не дают `413`/`401`).
+Empty allowlist (dev, warning in the log); IPv4, IPv6 and single addresses; a top-level
+subnet `0.0.0.0/0` (allows all IPv4 addresses; a separate `::/0` is needed for IPv6);
+IPv4-mapped subnets (`::ffff:a.b.c.d/nn`) are normalized to IPv4; `RemoteAddr` without a
+port, with an IPv6 zone (rejection) or unparsable (rejection); spoofing of
+`X-Forwarded-For` with a forbidden peer (does not help); `rate_rps=0` (limit disabled);
+`rate_burst=0` (normalized to rps); burst exhaustion; token refill over time; concurrent
+requests to the bucket; limit and allowlist together; a request rejected before reading
+the body and before signature verification (tests: an oversized body and a missing
+signature rejected by address/limit do not produce `413`/`401`).
 
-## 8. Нефункциональные требования
+## 8. Non-functional requirements
 
-Проверки дешевые (O(1), без аллокаций на запрос), не влияют на бюджет 500 мс; bucket
-не создает горутин; лимит не зависит от внешних сервисов; 429/403 не пишут сырое тело
-и адрес клиента в problem+json (адрес допускается в логах уровня warn).
+The checks are cheap (O(1), no per-request allocations) and do not affect the 500 ms
+budget; the bucket does not create goroutines; the limit does not depend on external
+services; 429/403 do not write the raw body or the client address into problem+json (the
+address is allowed in warn-level logs).
 
-## 9. План тестов
+## 9. Test plan
 
-| Уровень | Сценарии |
+| Level | Scenarios |
 | :-- | :-- |
-| Unit (домен) | разбор `ip_allowlist` (IPv4/IPv6/одиночные/мусор/лимит 64), диапазоны `rate_rps`/`rate_burst`, дефолт burst; limiter: всплеск, пополнение по времени, выключен, конкурентность |
-| Unit (транспорт) | `403` для чужого IPv4/IPv6, `200` для разрешенного, игнорирование `X-Forwarded-For`, fail-closed при мусорном `RemoteAddr`, `429` + `Retry-After` после всплеска, восстановление после пополнения, порядок проверок (403/429 до чтения тела) |
-| Integration | существующие сценарии проходят с включенным allowlist (localhost-адрес testcontainers-клиента не участвует: транспорт - httptest) |
-| E2E | без изменений (5.1) |
-| Load | 5.4: лимит настроен выше профиля |
+| Unit (domain) | parsing of `ip_allowlist` (IPv4/IPv6/single/garbage/limit 64), `rate_rps`/`rate_burst` ranges, default burst; limiter: burst, refill over time, disabled, concurrency |
+| Unit (transport) | `403` for a foreign IPv4/IPv6, `200` for an allowed one, ignoring of `X-Forwarded-For`, fail-closed on a garbage `RemoteAddr`, `429` plus `Retry-After` after the burst, recovery after refill, order of checks (403/429 before reading the body) |
+| Integration | existing scenarios pass with the allowlist enabled (the localhost address of the testcontainers client is not involved: the transport is httptest) |
+| E2E | unchanged (5.1) |
+| Load | 5.4: the limit is configured above the profile |
 
-## 10. План работ и коммит
+## 10. Work plan and commit
 
-Тесты вперед (домен, limiter, транспорт), затем реализация: поля и валидация конфига,
-`internal/domain/limiter.go`, проверки в `internal/transport/server.go`,
-`SetTrustedProxies(nil)` в main. Коммит `CBL-5.3: allowlist IP и лимиты вебхуков`;
-спека в том же коммите.
+Tests first (domain, limiter, transport), then the implementation: config fields and
+validation, `internal/domain/limiter.go`, checks in `internal/transport/server.go`,
+`SetTrustedProxies(nil)` in main. Commit `CBL-5.3: allowlist IP and webhook rate limits`;
+the spec is in the same commit.
 
-## 11. Открытые вопросы
+## 11. Open questions
 
-- Агрегатный лимит при нескольких репликах не поддерживается (in-process); решение
-  принято ради отсутствия Redis на критическом пути (T-02). Агрегатная защита - сетевая
-  (0.3: NetworkPolicy/файрвол, лимиты LB); периметр API Gateway (7.5) вебхуки не видит,
-  на него рассчитывать нельзя. Пересмотр - при появлении мультирепличного требования.
-- Сброс bucket при рестарте/деплое дает краткий легитимный всплеск выше `rate_rps`;
-  принято (лимит - защита от перебора, не биллинг).
-- Токены расходуются до проверки подписи: при пустом allowlist сканер может исчерпать
-  bucket и вызвать `429` для реальных доставок до истечения окна; в prod allowlist
-  обязателен, порог проверяется нагрузкой 5.4.
-- За прокси/балансировщиком адрес пира будет адресом прокси: allowlist заполняется
-  адресами прокси, реальный адрес шлюза не различается; решение - сетевые ограничения
-  (0.3) и ограничение доступа на транспортном уровне к шлюзу (0.6, KI-webhook-ingress-04).
+- The aggregate limit with several replicas is not supported (in-process); the decision
+  was made to keep Redis off the critical path (T-02). Aggregate protection is
+  network-level (0.3: NetworkPolicy/firewall, LB limits); the API Gateway perimeter (7.5)
+  does not see webhooks and must not be relied on. Revisit when a multi-replica
+  requirement appears.
+- A bucket reset on restart/deploy gives a brief legitimate burst above `rate_rps`; this
+  is accepted (the limit is protection against brute force, not billing).
+- Tokens are consumed before signature verification: with an empty allowlist a scanner
+  can exhaust the bucket and cause `429` for real deliveries until the window expires; in
+  prod the allowlist is mandatory, and the threshold is verified by load test 5.4.
+- Behind a proxy/load balancer the peer address will be the proxy address: the allowlist
+  is filled with proxy addresses and the real gateway address is not distinguished; the
+  solution is network restrictions (0.3) and transport-level access restriction to the
+  gateway (0.6, KI-webhook-ingress-04).
 
-## 12. Ревью (CBL-001, шаг 6)
+## 12. Review (CBL-001, step 6)
 
-Четыре независимых прохода (14.10.2026). Блокеров нет. Общий MAJOR всех ролей (не был
-реализован warn при пустом allowlist) закрыт `domain.MissingAllowlist` и предупреждением
-при старте; MAJOR архитектуры (неверная компенсация «агрегатный лимит - периметр 7.5»)
-закрыт исправлением T-WH-06, FR-5 и раздела 11; остальные замечания закрыты тестами,
-порядком проверок и уточнениями документации.
+Four independent passes (14.10.2026). No blockers. The common MAJOR of all roles (the
+warning for an empty allowlist was not implemented) was closed by
+`domain.MissingAllowlist` and a warning at startup; the architecture MAJOR (incorrect
+compensation "aggregate limit is perimeter 7.5") was closed by revising T-WH-06, FR-5
+and section 11; the remaining findings were closed by tests, the order of checks and
+documentation clarifications.
 
-| Роль | Ключевые замечания | Закрытие |
+| Role | Key findings | Closure |
 | :-- | :-- | :-- |
-| Без контекста | нет warn при пустом allowlist; порядок проверок не доказан тестами; нет refill-теста на транспорте; integration без allowlist; строгость `rate_burst` без `rate_rps`; `0.0.0.0/0` и IPv6; журнал опережает процесс; границы 64/100000/1000000 не приняты тестами; `RemoteAddr` без порта | warn реализован и покрыт `MissingAllowlist`; тесты «403/429 раньше тела и подписи»; refill-тест с управляемыми часами; `TestIntegrationAllowlistActive`; правило внесено в FR-1; уточнение про `::/0`; финализация этим блоком; граничные тесты; кейс без порта и зона IPv6 в таблице |
-| Архитектуры | MAJOR: компенсация агрегатного лимита ссылалась на 7.5 (периметр не видит вебхуки); enumeration через 404/403; health/metrics вне FR-5; mTLS 0.6 только межсервисный; план тестов шире реализации; rate_burst нормализуется только в limiter | T-WH-06/FR-5/раздел 11 переписаны (агрегат - сетевая защита 0.3); allowlist перенесен до endpoint; FR-5 дополнен изоляцией health/metrics; T-WH-05/KI-04 уточнены; тесты добавлены; нормализация в конфиге |
-| С контекстом | MAJOR: warn при пустом allowlist отсутствует; журнал опережает ревью; mapped-CIDR становится мертвой записью; границы не приняты тестами; план тестов шире реализации; форматирование; `SetTrustedProxies(nil)` против кода; зависимость 5.3 в CBL-004 | warn реализован; финализация; mapped-подсети нормализуются (`normalizePrefix`); граничные тесты; тесты добавлены; пустая строка; `nil` в main; CBL-004 обновлен |
-| Безопасности | MAJOR: warn отсутствует (fail-open dev-режим незаметен); токены расходуются до подписи (сканеры исчерпывают bucket); mapped-CIDR; кейсы без порта/зоны не защищены тестами; двойной warn-лог на 403 | warn реализован; риск зафиксирован в разделе 11 и T-WH-06 (allowlist обязателен в prod); нормализация префиксов; тесты добавлены; сэмплирование логов - 0.7 |
+| No context | no warning for an empty allowlist; the order of checks is not proven by tests; no refill test at the transport level; integration without the allowlist; strictness of `rate_burst` without `rate_rps`; `0.0.0.0/0` and IPv6; the journal runs ahead of the process; the boundaries 64/100000/1000000 are not covered by tests; `RemoteAddr` without a port | the warning is implemented and covered by `MissingAllowlist`; tests "403/429 before the body and the signature"; a refill test with controlled clocks; `TestIntegrationAllowlistActive`; the rule is added to FR-1; a clarification about `::/0`; finalization by this block; boundary tests; the no-port case and the IPv6 zone in the table |
+| Architecture | MAJOR: the compensation of the aggregate limit referenced 7.5 (the perimeter does not see webhooks); enumeration through 404/403; health/metrics outside FR-5; mTLS 0.6 is inter-service only; the test plan is wider than the implementation; rate_burst is normalized only in the limiter | T-WH-06/FR-5/section 11 rewritten (aggregate protection is network-level 0.3); the allowlist moved before the endpoint; FR-5 extended with the isolation of health/metrics; T-WH-05/KI-04 clarified; tests added; normalization in the config |
+| With context | MAJOR: the warning for an empty allowlist is missing; the journal runs ahead of the review; a mapped CIDR becomes a dead entry; the boundaries are not covered by tests; the test plan is wider than the implementation; formatting; `SetTrustedProxies(nil)` against the code; dependency 5.3 in CBL-004 | the warning is implemented; finalization; mapped subnets are normalized (`normalizePrefix`); boundary tests; tests added; empty line; `nil` in main; CBL-004 updated |
+| Security | MAJOR: the warning is missing (fail-open dev mode is unnoticeable); tokens are consumed before the signature (scanners exhaust the bucket); mapped CIDR; the no-port/zone cases are not protected by tests; a double warn log on 403 | the warning is implemented; the risk is recorded in section 11 and T-WH-06 (the allowlist is mandatory in prod); prefix normalization; tests added; log sampling is 0.7 |

@@ -1,7 +1,7 @@
 //go:build e2e
 
-// Пакет e2e содержит сквозной сценарий webhook-ingress: подписанный вебхук
-// через HTTP попадает в PostgreSQL (inbox и outbox) и публикуется в Kafka.
+// Package e2e contains the webhook-ingress end-to-end scenario: a signed webhook
+// travels over HTTP into PostgreSQL (inbox and outbox) and is published to Kafka.
 package e2e
 
 import (
@@ -150,7 +150,7 @@ func TestE2EWebhookToKafka(t *testing.T) {
 			time.Sleep(500 * time.Millisecond)
 		}
 	}
-	require.NotNil(t, record, "сообщение не доставлено в Kafka за 45 секунд")
+	require.NotNil(t, record, "message was not delivered to Kafka within 45 seconds")
 	assert.Equal(t, "mock:g-e2e", string(record.Key))
 
 	var raw eventsv1.GatewayWebhookRaw

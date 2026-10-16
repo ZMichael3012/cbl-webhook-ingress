@@ -1,3 +1,3 @@
-// Пакет usecase содержит сценарии использования сервиса webhook-ingress:
-// оркестрацию доменных правил, транзакций и публикации событий.
+// Package usecase contains use cases of the webhook-ingress service:
+// orchestration of domain rules, transactions and event publication.
 package usecase

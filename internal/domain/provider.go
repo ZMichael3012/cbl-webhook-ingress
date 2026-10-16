@@ -1,4 +1,4 @@
-// Пакет domain содержит модель настроек приема вебхуков провайдеров.
+// Package domain contains the model of provider webhook intake settings.
 package domain
 
 import (
@@ -10,46 +10,46 @@ import (
 	"strings"
 )
 
-// ErrInvalidConfig сообщает о некорректной конфигурации провайдеров.
+// ErrInvalidConfig reports an invalid provider configuration.
 var ErrInvalidConfig = errors.New("webhook-ingress: invalid provider config")
 
-// Границы конфигурации защиты провайдера.
+// Bounds of the provider protection configuration.
 const (
-	// MaxAllowlistEntries задает предельное число записей allowlist.
+	// MaxAllowlistEntries sets the maximum number of allowlist entries.
 	MaxAllowlistEntries = 64
-	// MaxRateRPS задает верхнюю границу скорости приема в секунду.
+	// MaxRateRPS sets the upper bound of the intake rate per second.
 	MaxRateRPS = 100_000
-	// MaxRateBurst задает верхнюю границу всплеска лимита.
+	// MaxRateBurst sets the upper bound of the rate limit burst.
 	MaxRateBurst = 1_000_000
 )
 
-// ProviderConfig описывает настройки приема вебхуков одного провайдера.
+// ProviderConfig describes webhook intake settings of a single provider.
 type ProviderConfig struct {
-	// Name задает имя провайдера (ключ конфигурации).
+	// Name sets the provider name (configuration key).
 	Name string `json:"-"`
-	// SignatureHeader задает имя заголовка подписи.
+	// SignatureHeader sets the signature header name.
 	SignatureHeader string `json:"signature_header"`
-	// EventIDHeader задает имя заголовка идентификатора события.
+	// EventIDHeader sets the event identifier header name.
 	EventIDHeader string `json:"event_id_header"`
-	// SecretEnv задает имя переменной окружения с секретом подписи.
+	// SecretEnv sets the name of the environment variable with the signing secret.
 	SecretEnv string `json:"secret_env"`
-	// Endpoints задает allowlist допустимых endpoint_id; пустое значение разрешает любые.
+	// Endpoints sets the allowlist of allowed endpoint_id values; an empty value allows any.
 	Endpoints []string `json:"endpoints"`
-	// IPAllowlist задает допустимые адреса шлюза (CIDR или одиночные адреса);
-	// пустое значение разрешает любые адреса.
+	// IPAllowlist sets the allowed gateway addresses (CIDR or single addresses);
+	// an empty value allows any address.
 	IPAllowlist []string `json:"ip_allowlist"`
-	// RateRPS задает устойчивую скорость приема запросов в секунду (0 - без ограничения).
+	// RateRPS sets the sustained intake rate in requests per second (0 - no limit).
 	RateRPS int `json:"rate_rps"`
-	// RateBurst задает вместимость всплеска лимита (0 - равен RateRPS).
+	// RateBurst sets the rate limit burst capacity (0 - equal to RateRPS).
 	RateBurst int `json:"rate_burst"`
-	// Secret задает секрет подписи, подставленный из окружения.
+	// Secret sets the signing secret injected from the environment.
 	Secret []byte `json:"-"`
-	// Allowlist задает разобранные подсети шлюза.
+	// Allowlist sets the parsed gateway subnets.
 	Allowlist []netip.Prefix `json:"-"`
 }
 
-// AllowsIP проверяет адрес пира по allowlist провайдера;
-// пустой allowlist разрешает любой адрес (dev-режим).
+// AllowsIP checks a peer address against the provider allowlist;
+// an empty allowlist allows any address (dev mode).
 func (c ProviderConfig) AllowsIP(addr netip.Addr) bool {
 	if len(c.Allowlist) == 0 {
 		return true
@@ -63,10 +63,10 @@ func (c ProviderConfig) AllowsIP(addr netip.Addr) bool {
 	return false
 }
 
-// ParseProviders разбирает JSON-конфигурацию провайдеров вида
+// ParseProviders parses the JSON provider configuration of the form
 // {"mock":{"signature_header":"X-Signature","event_id_header":"X-Event-Id",
-// "secret_env":"MOCK_WEBHOOK_SECRET"}} и подставляет секреты через lookupEnv.
-// Необязательные поля ip_allowlist, rate_rps и rate_burst описывают защиту приема.
+// "secret_env":"MOCK_WEBHOOK_SECRET"}} and injects secrets via lookupEnv.
+// The optional fields ip_allowlist, rate_rps and rate_burst describe intake protection.
 func ParseProviders(raw string, lookupEnv func(string) string) (map[string]ProviderConfig, error) {
 	if strings.TrimSpace(raw) == "" {
 		return nil, fmt.Errorf("%w: empty config", ErrInvalidConfig)
@@ -107,8 +107,8 @@ func ParseProviders(raw string, lookupEnv func(string) string) (map[string]Provi
 	return providers, nil
 }
 
-// MissingAllowlist возвращает имена провайдеров с пустым ip_allowlist
-// в стабильном порядке: сервис предупреждает о fail-open dev-режиме.
+// MissingAllowlist returns the names of providers with an empty ip_allowlist
+// in a stable order: the service warns about the fail-open dev mode.
 func MissingAllowlist(providers map[string]ProviderConfig) []string {
 	names := make([]string, 0, len(providers))
 	for name, config := range providers {
@@ -120,8 +120,8 @@ func MissingAllowlist(providers map[string]ProviderConfig) []string {
 	return names
 }
 
-// parseAllowlist разбирает записи allowlist в подсети; одиночные адреса
-// трактуются как /32 или /128, IPv4-mapped подсети нормализуются к IPv4.
+// parseAllowlist parses allowlist entries into subnets; single addresses
+// are treated as /32 or /128, and IPv4-mapped subnets are normalized to IPv4.
 func parseAllowlist(raw []string) ([]netip.Prefix, error) {
 	if len(raw) > MaxAllowlistEntries {
 		return nil, fmt.Errorf("allowlist entries %d exceed %d", len(raw), MaxAllowlistEntries)
@@ -149,8 +149,8 @@ func parseAllowlist(raw []string) ([]netip.Prefix, error) {
 	return prefixes, nil
 }
 
-// normalizePrefix приводит IPv4-mapped подсеть к IPv4-диапазону,
-// чтобы запись конфигурации не оставалась мертвой.
+// normalizePrefix converts an IPv4-mapped subnet to an IPv4 range
+// so that the configuration entry does not stay dead.
 func normalizePrefix(prefix netip.Prefix) (netip.Prefix, error) {
 	if !prefix.Addr().Is4In6() {
 		return prefix.Masked(), nil
@@ -161,7 +161,7 @@ func normalizePrefix(prefix netip.Prefix) (netip.Prefix, error) {
 	return netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96).Masked(), nil
 }
 
-// validateRate проверяет и нормализует поля лимита приема провайдера.
+// validateRate validates and normalizes the provider intake rate limit fields.
 func validateRate(config ProviderConfig, name string) error {
 	if config.RateRPS < 0 || config.RateRPS > MaxRateRPS {
 		return fmt.Errorf("%w: provider %q rate_rps %d out of range", ErrInvalidConfig, name, config.RateRPS)

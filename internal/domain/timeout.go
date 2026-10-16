@@ -7,24 +7,24 @@ import (
 	"time"
 )
 
-// DefaultWriteTimeout задает бюджет записи вебхука по умолчанию.
+// DefaultWriteTimeout sets the default webhook write budget.
 const DefaultWriteTimeout = 450 * time.Millisecond
 
-// Границы допустимого бюджета записи вебхука.
+// Bounds of the allowed webhook write budget.
 const (
-	// MinWriteTimeout задает нижнюю границу бюджета записи.
+	// MinWriteTimeout sets the lower bound of the write budget.
 	MinWriteTimeout = 100 * time.Millisecond
-	// MaxWriteTimeout задает верхнюю границу бюджета записи.
+	// MaxWriteTimeout sets the upper bound of the write budget.
 	MaxWriteTimeout = 5 * time.Second
 )
 
-// ErrInvalidWriteTimeout сообщает о некорректном бюджете записи вебхука.
+// ErrInvalidWriteTimeout reports an invalid webhook write budget.
 var ErrInvalidWriteTimeout = errors.New("webhook-ingress: invalid write timeout")
 
-// ParseWriteTimeout разбирает конфигурацию бюджета записи вебхука:
-// пустое значение дает DefaultWriteTimeout, значения вне границ
-// прижимаются к MinWriteTimeout и MaxWriteTimeout, синтаксически
-// невалидные отклоняются.
+// ParseWriteTimeout parses the webhook write budget configuration:
+// an empty value yields DefaultWriteTimeout, out-of-bounds values
+// are clamped to MinWriteTimeout and MaxWriteTimeout, and syntactically
+// invalid values are rejected.
 func ParseWriteTimeout(raw string) (time.Duration, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {

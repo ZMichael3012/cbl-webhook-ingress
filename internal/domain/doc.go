@@ -1,3 +1,3 @@
-// Пакет domain содержит доменные модели, инварианты и правила сервиса webhook-ingress,
-// не зависящие от транспорта и хранилищ.
+// Package domain contains domain models, invariants and rules of the webhook-ingress
+// service that are independent of transports and storages.
 package domain

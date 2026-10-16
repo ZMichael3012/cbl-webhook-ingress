@@ -5,8 +5,8 @@ import (
 	"time"
 )
 
-// Limiter реализует потокобезопасный token bucket с ленивым пополнением:
-// фоновые горутины не нужны, состояние меняется только при вызовах Allow.
+// Limiter implements a thread-safe token bucket with lazy refill:
+// no background goroutines are needed, the state changes only in Allow calls.
 type Limiter struct {
 	mu     sync.Mutex
 	rps    float64
@@ -15,9 +15,8 @@ type Limiter struct {
 	last   time.Time
 }
 
-// NewLimiter создает Limiter со скоростью rps запросов в секунду и всплеском burst.
-// Нулевая или отрицательная скорость отключает ограничение; нулевой всплеск
-// принимается равным скорости.
+// NewLimiter creates a Limiter with the rate of rps requests per second and burst capacity.
+// A zero or negative rate disables limiting; a zero burst defaults to the rate.
 func NewLimiter(rps, burst int) *Limiter {
 	l := &Limiter{}
 	if rps <= 0 {
@@ -32,8 +31,8 @@ func NewLimiter(rps, burst int) *Limiter {
 	return l
 }
 
-// Allow сообщает, можно ли принять запрос в момент now: пополняет bucket
-// пропорционально прошедшему времени и расходует один токен.
+// Allow reports whether a request can be accepted at now: it refills the bucket
+// proportionally to the elapsed time and consumes one token.
 func (l *Limiter) Allow(now time.Time) bool {
 	if l == nil || l.rps <= 0 {
 		return true

@@ -1,5 +1,5 @@
-// main запускает HTTP-сервис webhook-ingress платформы CBL:
-// прием вебхуков провайдера с проверкой HMAC и публикацией через outbox.
+// main starts the CBL webhook-ingress HTTP service:
+// provider webhook intake with HMAC verification and publication via outbox.
 package main
 
 import (
@@ -28,8 +28,8 @@ import (
 	"github.com/cbl/cbl-webhook-ingress/internal/usecase"
 )
 
-// main поднимает HTTP-сервер приема вебхуков, применяет миграции
-// и запускает relay публикации outbox.
+// main brings up the webhook intake HTTP server, applies migrations
+// and starts the outbox publication relay.
 func main() {
 	log, err := zap.NewProduction()
 	if err != nil {
@@ -149,7 +149,7 @@ func main() {
 	log.Info("shutdown finished")
 }
 
-// metricsHandler отдает заглушку метрик до задачи 0.7.
+// metricsHandler serves the metrics placeholder until task 0.7.
 func metricsHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
@@ -159,7 +159,7 @@ func metricsHandler() http.Handler {
 	return mux
 }
 
-// getenv возвращает значение переменной окружения или значение по умолчанию.
+// getenv returns the environment variable value or the fallback value.
 func getenv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

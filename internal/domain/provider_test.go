@@ -97,7 +97,7 @@ func TestParseProvidersRateLimits(t *testing.T) {
 	assert.Equal(t, 200, config.RateBurst)
 
 	defaultBurst := parseOne(t, `{"mock":{"signature_header":"S","event_id_header":"E","secret_env":"SEC","rate_rps":50}}`)
-	assert.Equal(t, 50, defaultBurst.RateBurst, "пустой burst нормализуется в rate_rps")
+	assert.Equal(t, 50, defaultBurst.RateBurst, "an empty burst is normalized to rate_rps")
 
 	boundary := parseOne(t, `{"mock":{"signature_header":"S","event_id_header":"E","secret_env":"SEC",
 		"rate_rps":100000,"rate_burst":1000000}}`)
@@ -123,7 +123,7 @@ func TestProviderConfigAllowsIP(t *testing.T) {
 	t.Parallel()
 
 	empty := domain.ProviderConfig{}
-	assert.True(t, empty.AllowsIP(netip.MustParseAddr("203.0.113.9")), "пустой allowlist разрешает все")
+	assert.True(t, empty.AllowsIP(netip.MustParseAddr("203.0.113.9")), "an empty allowlist allows everything")
 
 	config := parseOne(t, `{"mock":{"signature_header":"S","event_id_header":"E","secret_env":"SEC",
 		"ip_allowlist":["10.0.0.0/8","192.0.2.7","2001:db8::/32"]}}`)
@@ -132,7 +132,7 @@ func TestProviderConfigAllowsIP(t *testing.T) {
 	assert.False(t, config.AllowsIP(netip.MustParseAddr("192.0.2.8")))
 	assert.True(t, config.AllowsIP(netip.MustParseAddr("2001:db8::1")))
 	assert.False(t, config.AllowsIP(netip.MustParseAddr("2001:db9::1")))
-	assert.True(t, config.AllowsIP(netip.MustParseAddr("::ffff:10.1.2.3")), "IPv4-mapped адрес разворачивается")
+	assert.True(t, config.AllowsIP(netip.MustParseAddr("::ffff:10.1.2.3")), "an IPv4-mapped address is unmapped")
 }
 
 func TestParseProvidersAllowAllPrefix(t *testing.T) {

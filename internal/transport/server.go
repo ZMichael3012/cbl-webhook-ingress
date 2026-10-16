@@ -1,5 +1,5 @@
-// Пакет transport содержит транспортный слой сервиса webhook-ingress:
-// HTTP-хендлеры Gin, собранные из usecase.
+// Package transport contains the transport layer of the webhook-ingress service:
+// Gin HTTP handlers assembled from usecase.
 package transport
 
 import (
@@ -26,15 +26,15 @@ import (
 	"github.com/cbl/cbl-webhook-ingress/internal/usecase"
 )
 
-// MaxBodyBytes задает предельный размер тела вебхука (1 МБ).
+// MaxBodyBytes sets the webhook body size limit (1 MB).
 const MaxBodyBytes int64 = 1 << 20
 
-// Handler описывает обработчик вебхука для транспортного слоя.
+// Handler describes the webhook handler for the transport layer.
 type Handler interface {
 	Handle(ctx context.Context, in usecase.WebhookInput) (bool, error)
 }
 
-// Server принимает вебхуки провайдеров.
+// Server accepts provider webhooks.
 type Server struct {
 	providers    map[string]domain.ProviderConfig
 	limiters     map[string]*domain.Limiter
@@ -46,10 +46,10 @@ type Server struct {
 	log          *zap.Logger
 }
 
-// Option настраивает Server.
+// Option configures a Server.
 type Option func(*Server)
 
-// WithClock задает источник времени для проверки окна replay.
+// WithClock sets the time source for the replay window check.
 func WithClock(clock func() time.Time) Option {
 	return func(s *Server) {
 		if clock != nil {
@@ -58,7 +58,7 @@ func WithClock(clock func() time.Time) Option {
 	}
 }
 
-// WithWindow задает окно replay подписи.
+// WithWindow sets the signature replay window.
 func WithWindow(window time.Duration) Option {
 	return func(s *Server) {
 		if window > 0 {
@@ -67,7 +67,7 @@ func WithWindow(window time.Duration) Option {
 	}
 }
 
-// WithMaxBody задает предельный размер тела вебхука.
+// WithMaxBody sets the webhook body size limit.
 func WithMaxBody(maxBody int64) Option {
 	return func(s *Server) {
 		if maxBody > 0 {
@@ -76,8 +76,8 @@ func WithMaxBody(maxBody int64) Option {
 	}
 }
 
-// WithWriteTimeout задает бюджет записи события в PostgreSQL;
-// значение прижимается к допустимому диапазону домена.
+// WithWriteTimeout sets the event write budget to PostgreSQL;
+// the value is clamped to the domain's allowed range.
 func WithWriteTimeout(timeout time.Duration) Option {
 	return func(s *Server) {
 		if timeout <= 0 {
@@ -93,7 +93,7 @@ func WithWriteTimeout(timeout time.Duration) Option {
 	}
 }
 
-// NewServer создает Server приема вебхуков.
+// NewServer creates a webhook intake Server.
 func NewServer(providers map[string]domain.ProviderConfig, handler Handler, log *zap.Logger, opts ...Option) *Server {
 	if log == nil {
 		log = zap.NewNop()
@@ -117,12 +117,12 @@ func NewServer(providers map[string]domain.ProviderConfig, handler Handler, log 
 	return s
 }
 
-// Register регистрирует маршрут приема вебхуков.
+// Register registers the webhook intake route.
 func (s *Server) Register(router gin.IRouter) {
 	router.POST("/hooks/:provider/:endpoint_id", s.handleWebhook)
 }
 
-// handleWebhook принимает вебхук: сырое тело, проверка HMAC, фиксация события.
+// handleWebhook accepts a webhook: raw body, HMAC verification, event recording.
 func (s *Server) handleWebhook(c *gin.Context) {
 	provider := c.Param("provider")
 	config, ok := s.providers[provider]
@@ -130,8 +130,8 @@ func (s *Server) handleWebhook(c *gin.Context) {
 		ginmw.AbortWithProblem(c, http.StatusNotFound, "provider_not_found", "Not Found", "провайдер не настроен")
 		return
 	}
-	// Сетевые проверки дешевле чтения тела и не раскрывают существование
-	// endpoint_id: чужой адрес отклоняется до всех остальных проверок.
+	// Network checks are cheaper than reading the body and do not reveal
+	// the existence of endpoint_id: a foreign address is rejected before all other checks.
 	if len(config.Allowlist) > 0 {
 		addr, ok := remoteIP(c.Request.RemoteAddr)
 		if !ok || !config.AllowsIP(addr) {
@@ -166,8 +166,8 @@ func (s *Server) handleWebhook(c *gin.Context) {
 		return
 	}
 
-	// Подпись проверяется до разбора заголовков события: неаутентифицированный клиент
-	// не должен получать различимые ответы о структуре запроса.
+	// The signature is verified before event headers are parsed: an unauthenticated
+	// client must not receive distinguishable responses about the request structure.
 	signature := c.GetHeader(config.SignatureHeader)
 	if signature == "" {
 		ginmw.AbortWithProblem(c, http.StatusUnauthorized, "invalid_signature", "Unauthorized", "")
@@ -186,8 +186,8 @@ func (s *Server) handleWebhook(c *gin.Context) {
 		return
 	}
 
-	// Бюджет записи защищает ответ от деградации PostgreSQL: прерванная
-	// транзакция откатывается, провайдер повторит доставку, дублей не будет.
+	// The write budget protects the response from PostgreSQL degradation: the aborted
+	// transaction is rolled back, the provider retries the delivery, and there will be no duplicates.
 	writeCtx, cancel := context.WithTimeout(c.Request.Context(), s.writeTimeout)
 	defer cancel()
 	processed, err := s.handler.Handle(writeCtx, usecase.WebhookInput{
@@ -199,14 +199,14 @@ func (s *Server) handleWebhook(c *gin.Context) {
 		GatewayID:     extractGatewayID(body),
 	})
 	if err != nil {
-		// Исчерпание бюджета приходит двумя формами: ожидание блокировки и
-		// выполнение запроса дают context.DeadlineExceeded, а дедлайн на
-		// установлении соединения на Linux завершает dial через
-		// os.ErrDeadlineExceeded ("i/o timeout", проверено профилем 5.4:
-		// гонка с ctx.Err() не позволяет отличать его по состоянию контекста).
-		// В write-пути единственный внешний I/O - PostgreSQL, поэтому i/o
-		// таймаут здесь означает исчерпание бюджета; при появлении других
-		// сетевых вызовов внутри Handler классификацию потребуется уточнить.
+		// Budget exhaustion arrives in two forms: waiting for a lock and
+		// executing the query yield context.DeadlineExceeded, while the deadline
+		// on connection establishment on Linux terminates dial through
+		// os.ErrDeadlineExceeded ("i/o timeout", verified by profile 5.4:
+		// a race with ctx.Err() does not allow distinguishing it by context state).
+		// In the write path the only external I/O is PostgreSQL, so an i/o
+		// timeout here means budget exhaustion; if other network calls appear
+		// inside Handler, the classification will need to be refined.
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
 			s.log.Warn("webhook write budget exceeded",
 				zap.String("provider", provider),
@@ -218,8 +218,8 @@ func (s *Server) handleWebhook(c *gin.Context) {
 			return
 		}
 		if errors.Is(err, context.Canceled) {
-			// Клиент отменил запрос: ответ не важен, Error здесь создал бы
-			// ложный шум в метрике доли ошибок (0.7).
+			// The client canceled the request: the response does not matter, and Error
+			// here would create false noise in the error rate metric (0.7).
 			s.log.Info("webhook handling canceled by client", zap.String("provider", provider))
 			ginmw.AbortWithProblem(c, http.StatusRequestTimeout, "request_canceled", "Request Timeout", "")
 			return
@@ -231,8 +231,8 @@ func (s *Server) handleWebhook(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "accepted", "duplicate": !processed})
 }
 
-// remoteIP извлекает адрес TCP-пира запроса; proxy-заголовки не читаются,
-// чтобы подделка X-Forwarded-For не обходила allowlist.
+// remoteIP extracts the TCP peer address of the request; proxy headers are not read
+// so that a forged X-Forwarded-For cannot bypass the allowlist.
 func remoteIP(remoteAddr string) (netip.Addr, bool) {
 	host, _, err := net.SplitHostPort(strings.TrimSpace(remoteAddr))
 	if err != nil {
@@ -245,7 +245,7 @@ func remoteIP(remoteAddr string) (netip.Addr, bool) {
 	return addr.Unmap(), true
 }
 
-// sensitiveHeaders задает заголовки, которые не попадают в событие и хранилища.
+// sensitiveHeaders sets headers that never reach the event and storages.
 var sensitiveHeaders = map[string]struct{}{
 	"authorization":       {},
 	"cookie":              {},
@@ -254,9 +254,9 @@ var sensitiveHeaders = map[string]struct{}{
 	"x-api-key":           {},
 }
 
-// flattenHeaders приводит заголовки запроса к карте первых значений,
-// исключая потенциально чувствительные заголовки и заголовок подписи:
-// имя заголовка подписи настраивается и задается отдельно.
+// flattenHeaders converts request headers to a map of first values,
+// excluding potentially sensitive headers and the signature header:
+// the signature header name is configurable and is set separately.
 func flattenHeaders(header http.Header, signatureHeader string) map[string]string {
 	headers := make(map[string]string, len(header))
 	for key, values := range header {
@@ -274,7 +274,7 @@ func flattenHeaders(header http.Header, signatureHeader string) map[string]strin
 	return headers
 }
 
-// extractGatewayID извлекает gateway_id из тела без строгого разбора JSON.
+// extractGatewayID extracts gateway_id from the body without strict JSON parsing.
 func extractGatewayID(body []byte) string {
 	var parsed map[string]json.RawMessage
 	if err := json.Unmarshal(body, &parsed); err != nil {

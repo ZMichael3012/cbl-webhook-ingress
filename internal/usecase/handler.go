@@ -1,5 +1,5 @@
-// Пакет usecase содержит сценарий приема вебхука: идемпотентная фиксация
-// события в inbox и outbox одной транзакцией без ожидания Kafka.
+// Package usecase contains the webhook intake use case: idempotent recording
+// of an event in inbox and outbox within one transaction without waiting for Kafka.
 package usecase
 
 import (
@@ -20,26 +20,26 @@ import (
 	"github.com/cbl/cbl-kit/outbox"
 )
 
-// TopicGatewayWebhooksRaw задает топик сырых вебхуков провайдера.
+// TopicGatewayWebhooksRaw sets the topic of raw provider webhooks.
 const TopicGatewayWebhooksRaw = "gateway.webhooks.raw"
 
-// WebhookInput описывает принятый вебхук провайдера.
+// WebhookInput describes an accepted provider webhook.
 type WebhookInput struct {
-	// Provider задает имя провайдера.
+	// Provider sets the provider name.
 	Provider string
-	// EndpointID задает идентификатор эндпоинта из пути.
+	// EndpointID sets the endpoint identifier from the path.
 	EndpointID string
-	// VendorEventID задает идентификатор события провайдера из заголовка.
+	// VendorEventID sets the provider event identifier from the header.
 	VendorEventID string
-	// Headers задает заголовки запроса.
+	// Headers sets the request headers.
 	Headers map[string]string
-	// RawBody задает сырое тело запроса.
+	// RawBody sets the raw request body.
 	RawBody []byte
-	// GatewayID задает идентификатор платежа у провайдера, если извлечен из тела.
+	// GatewayID sets the provider payment identifier if it was extracted from the body.
 	GatewayID string
 }
 
-// Handler фиксирует вебхуки в inbox и outbox.
+// Handler records webhooks in inbox and outbox.
 type Handler struct {
 	db       *gorm.DB
 	guard    *inbox.Guard
@@ -49,7 +49,7 @@ type Handler struct {
 	log      *zap.Logger
 }
 
-// NewHandler создает Handler сервиса webhook-ingress.
+// NewHandler creates a webhook-ingress service Handler.
 func NewHandler(db *gorm.DB, producer string, log *zap.Logger) *Handler {
 	if log == nil {
 		log = zap.NewNop()
@@ -64,13 +64,13 @@ func NewHandler(db *gorm.DB, producer string, log *zap.Logger) *Handler {
 	}
 }
 
-// Handle сохраняет событие; повторная доставка того же события не создает дубль.
-// Возвращает processed=false, если событие уже было принято ранее.
+// Handle stores the event; redelivery of the same event does not create a duplicate.
+// It returns processed=false if the event was already accepted earlier.
 func (h *Handler) Handle(ctx context.Context, in WebhookInput) (bool, error) {
 	eventID := uuid.NewSHA1(uuid.NameSpaceURL, []byte("cbl-webhook:"+in.Provider+":"+in.VendorEventID)).String()
 	gatewayID := strings.TrimSpace(in.GatewayID)
-	// Ключ партиции сохраняет порядок по сущности: при отсутствии gateway_id
-	// используется endpoint_id, а поле конверта остается unknown (CBL-5.1 FR-4).
+	// The partition key preserves per-entity ordering: when gateway_id is absent,
+	// endpoint_id is used and the envelope field stays unknown (CBL-5.1 FR-4).
 	partitionKey := in.Provider + ":" + gatewayID
 	if gatewayID == "" {
 		gatewayID = "unknown"
