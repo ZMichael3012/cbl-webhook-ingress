@@ -37,6 +37,7 @@ func TestParseAndVerifyRawHMAC(t *testing.T) {
 	config := parseVerified(t, `{"btcpay":{
 		"secret_env":"SECRET_ENV",
 		"verification":{"strategy":"raw_hmac","header":"BTCPay-Sig","prefix":"sha256="},
+		"event_key":{"header":"X-Delivery-Id"},
 		"fetch_required":true
 	}}`)
 	require.Equal(t, domain.StrategyRawHMAC, config.StrategyName())
@@ -68,7 +69,8 @@ func TestVerifyCanonicalJSONHMAC(t *testing.T) {
 	t.Parallel()
 	config := parseVerified(t, `{"nowpayments":{
 		"secret_env":"SECRET_ENV",
-		"verification":{"strategy":"canonical_json_hmac","header":"x-nowpayments-sig","algorithm":"sha512"}
+		"verification":{"strategy":"canonical_json_hmac","header":"x-nowpayments-sig","algorithm":"sha512"},
+		"event_key":{"template":"{payment_id}:{payment_status}"}
 	}}`)
 	body := []byte(`{"price_amount": 10.5, "order_id": "a"}`)
 	canonical, err := webhooksig.CanonicalJSON(body)
@@ -96,7 +98,8 @@ func TestVerifyTokenEcho(t *testing.T) {
 	config := parseVerified(t, `{"coingate":{
 		"secret_env":"SECRET_ENV",
 		"verification":{"strategy":"token_echo","field":"token"},
-		"fetch_required":true
+		"fetch_required":true,
+		"event_key":{"header":"X-Event-Id"}
 	}}`)
 	require.Equal(t, "", config.SignatureHeaderName())
 
@@ -123,12 +126,12 @@ func TestVerifyTokenEcho(t *testing.T) {
 
 func TestResponsePolicy(t *testing.T) {
 	t.Parallel()
-	token := parseVerified(t, `{"coingate":{"secret_env":"SECRET_ENV","verification":{"strategy":"token_echo"}}}`)
+	token := parseVerified(t, `{"coingate":{"secret_env":"SECRET_ENV","fetch_required":true,"verification":{"strategy":"token_echo"},"event_key":{"header":"X-Event-Id"}}}`)
 	status, record := token.ResponsePolicy(domain.VerifyEchoMismatch)
 	require.Equal(t, http.StatusOK, status)
 	require.True(t, record)
 
-	hmacConfig := parseVerified(t, `{"btcpay":{"secret_env":"SECRET_ENV","verification":{"strategy":"raw_hmac","header":"BTCPay-Sig"}}}`)
+	hmacConfig := parseVerified(t, `{"btcpay":{"secret_env":"SECRET_ENV","verification":{"strategy":"raw_hmac","header":"BTCPay-Sig"},"event_key":{"header":"X-Event-Id"}}}`)
 	status, record = hmacConfig.ResponsePolicy(domain.VerifyVerified)
 	require.Equal(t, http.StatusOK, status)
 	require.True(t, record)
@@ -144,16 +147,28 @@ func TestResponsePolicy(t *testing.T) {
 
 func TestRedactToken(t *testing.T) {
 	t.Parallel()
-	config := parseVerified(t, `{"coingate":{"secret_env":"SECRET_ENV","verification":{"strategy":"token_echo"}}}`)
-	redacted := config.RedactToken([]byte(`{"order_id":1,"token":"s3cret"}`))
+	config := parseVerified(t, `{"coingate":{"secret_env":"SECRET_ENV","fetch_required":true,"verification":{"strategy":"token_echo"},"event_key":{"header":"X-Event-Id"}}}`)
+	redacted, ok := config.RedactToken([]byte(`{"order_id":1,"token":"s3cret"}`))
+	require.True(t, ok)
 	require.JSONEq(t, `{"order_id":1,"token":""}`, string(redacted))
 
-	unchanged := config.RedactToken([]byte(`not json`))
-	require.Equal(t, `not json`, string(unchanged))
+	redacted, ok = config.RedactToken([]byte(`not json`))
+	require.False(t, ok)
+	require.Nil(t, redacted)
 
-	raw := parseVerified(t, `{"btcpay":{"secret_env":"SECRET_ENV","verification":{"strategy":"raw_hmac","header":"BTCPay-Sig"}}}`)
+	redacted, ok = config.RedactToken([]byte(`{"token":"s3cret"} trailing`))
+	require.False(t, ok)
+	require.Nil(t, redacted)
+
+	redacted, ok = config.RedactToken([]byte(`["token"]`))
+	require.False(t, ok)
+	require.Nil(t, redacted)
+
+	raw := parseVerified(t, `{"btcpay":{"secret_env":"SECRET_ENV","verification":{"strategy":"raw_hmac","header":"BTCPay-Sig"},"event_key":{"header":"X-Event-Id"}}}`)
 	body := []byte(`{"token":"s3cret"}`)
-	require.Equal(t, body, raw.RedactToken(body))
+	unchanged, ok := raw.RedactToken(body)
+	require.True(t, ok)
+	require.Equal(t, body, unchanged)
 }
 
 func TestParseProvidersVerificationValidation(t *testing.T) {

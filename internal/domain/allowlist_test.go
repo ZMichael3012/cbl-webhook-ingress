@@ -21,6 +21,18 @@ func TestParseAllowlistText(t *testing.T) {
 
 	_, err = domain.ParseAllowlistText("not-an-ip")
 	require.Error(t, err)
+
+	_, err = domain.ParseAllowlistText("0.0.0.0/0")
+	require.ErrorContains(t, err, "catch-all")
+
+	_, err = domain.ParseAllowlistText("::/0")
+	require.ErrorContains(t, err, "catch-all")
+
+	_, err = domain.ParseAllowlistText("127.0.0.1")
+	require.ErrorContains(t, err, "loopback")
+
+	_, err = domain.ParseAllowlistText("169.254.1.1")
+	require.ErrorContains(t, err, "link-local")
 }
 
 func TestDynamicAllowlist(t *testing.T) {

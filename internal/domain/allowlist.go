@@ -82,6 +82,12 @@ func ParseAllowlistText(text string) ([]netip.Prefix, error) {
 		if err != nil {
 			return nil, err
 		}
+		// A provider list must never contain a catch-all or unspecified address:
+		// a poisoned source could otherwise replace the dynamic set with "allow
+		// everything". Static operator configuration keeps its explicit 0.0.0.0/0.
+		if prefix.Bits() == 0 || prefix.Addr().IsUnspecified() {
+			return nil, fmt.Errorf("catch-all allowlist entry %q is forbidden in a dynamic list", prefix)
+		}
 		prefixes = append(prefixes, prefix)
 	}
 	return prefixes, nil

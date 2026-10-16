@@ -56,6 +56,7 @@ func TestHandleWebhookTokenEchoVerified(t *testing.T) {
 	t.Parallel()
 	providers := parsedProviders(t, `{"coingate":{
 		"secret_env":"E",
+		"fetch_required":true,
 		"verification":{"strategy":"token_echo"},
 		"event_key":{"template":"{id}:{status}"}
 	}}`)
@@ -104,10 +105,11 @@ func TestHandleWebhookRawHMACRejectsMismatch(t *testing.T) {
 	require.Equal(t, "delivery-1", handler.lastInput.VendorEventID)
 }
 
-func TestHandleWebhookVerifiedTemplateMissingKey(t *testing.T) {
+func TestHandleWebhookTokenEchoMissingKeyUsesRandomID(t *testing.T) {
 	t.Parallel()
 	providers := parsedProviders(t, `{"coingate":{
 		"secret_env":"E",
+		"fetch_required":true,
 		"verification":{"strategy":"token_echo"},
 		"event_key":{"template":"{id}:{status}"}
 	}}`)
@@ -118,14 +120,65 @@ func TestHandleWebhookVerifiedTemplateMissingKey(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/hooks/coingate/ep1", strings.NewReader(body))
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, req)
+
+	// Token echo must never answer 4xx: the delivery is recorded and the
+	// handler assigns a random event id.
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	require.Equal(t, 1, handler.calls)
+	require.Equal(t, domain.VerifyVerified, handler.lastInput.SignatureState)
+	require.Equal(t, "", handler.lastInput.VendorEventID)
+}
+
+func TestHandleWebhookOversizedVendorKeyRejected(t *testing.T) {
+	t.Parallel()
+	providers := parsedProviders(t, `{"bitpay":{
+		"secret_env":"E",
+		"verification":{"strategy":"raw_hmac","header":"X-Sig"},
+		"event_key":{"template":"{data.id}"}
+	}}`)
+	handler := &fakeHandler{processed: true}
+	router := newTestRouterWithProviders(providers, handler)
+
+	longID := strings.Repeat("a", 200)
+	body := `{"data":{"id":"` + longID + `"}}`
+	mac := hmac.New(sha256.New, []byte(testSecret))
+	mac.Write([]byte(body))
+	req := httptest.NewRequest(http.MethodPost, "/hooks/bitpay/ep1", strings.NewReader(body))
+	req.Header.Set("X-Sig", hex.EncodeToString(mac.Sum(nil)))
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
 	require.Equal(t, http.StatusUnprocessableEntity, recorder.Code)
 	require.Zero(t, handler.calls)
+}
+
+func TestHandleWebhookRedactionFailureDropsBody(t *testing.T) {
+	t.Parallel()
+	providers := parsedProviders(t, `{"coingate":{
+		"secret_env":"E",
+		"fetch_required":true,
+		"verification":{"strategy":"token_echo"},
+		"event_key":{"template":"{id}:{status}"}
+	}}`)
+	handler := &fakeHandler{processed: true}
+	router := newTestRouterWithProviders(providers, handler)
+
+	// The body cannot be redacted (trailing data): the raw body must not be stored.
+	body := `{"id":1,"status":"new","token":"` + testSecret + `"} trailing`
+	req := httptest.NewRequest(http.MethodPost, "/hooks/coingate/ep1", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	require.Equal(t, 1, handler.calls)
+	require.Nil(t, handler.lastInput.RawBody)
 }
 
 func TestHandleWebhookDynamicAllowlist(t *testing.T) {
 	t.Parallel()
 	providers := parsedProviders(t, `{"coingate":{
 		"secret_env":"E",
+		"fetch_required":true,
 		"verification":{"strategy":"token_echo"},
 		"event_key":{"template":"{id}:{status}"}
 	}}`)

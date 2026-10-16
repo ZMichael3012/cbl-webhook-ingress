@@ -70,7 +70,10 @@ func main() {
 	dynamic := domain.NewDynamicAllowlist()
 	sources := allowlistSources(providers)
 	if len(sources) > 0 && refreshInterval == 0 {
-		log.Warn("dynamic allowlists are configured but WEBHOOK_ALLOWLIST_REFRESH is 0: refreshes disabled")
+		// URL-only providers stay fail-closed without refreshes: that would
+		// silently break their intake, so it is a startup error, not a warning.
+		log.Error("dynamic allowlists are configured but WEBHOOK_ALLOWLIST_REFRESH is 0")
+		return
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -101,6 +104,12 @@ func main() {
 
 	if len(sources) > 0 && refreshInterval > 0 {
 		refresher := usecase.NewAllowlistRefresher(sources, dynamic, refreshInterval, log)
+		// The first load runs before the intake starts: a URL-only provider is
+		// fail-closed until the dynamic set is known (17.4).
+		if refreshErr := refresher.Refresh(ctx); refreshErr != nil {
+			log.Warn("initial dynamic allowlist refresh failed; the affected intake stays fail-closed until the first successful load",
+				zap.Error(refreshErr))
+		}
 		go refresher.Run(ctx)
 	}
 

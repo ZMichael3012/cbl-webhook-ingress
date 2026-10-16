@@ -145,6 +145,17 @@ func ParseProviders(raw string, lookupEnv func(string) string) (map[string]Provi
 		if _, err := config.verifier(); err != nil {
 			return nil, err
 		}
+		if config.Verification != nil &&
+			config.Verification.Strategy == StrategyTokenEcho && !config.FetchRequired {
+			// The CoinGate status model requires a provider fetch before a
+			// canonical event (CBL-003 section 4); a config without it would
+			// silently ship raws the connector cannot trust.
+			return nil, fmt.Errorf("%w: provider %q: token_echo requires fetch_required", ErrInvalidConfig, name)
+		}
+		if config.Verification != nil && config.EventKey == nil && strings.TrimSpace(config.EventIDHeader) == "" {
+			return nil, fmt.Errorf("%w: provider %q: a verification strategy requires event_key or event_id_header",
+				ErrInvalidConfig, name)
+		}
 		if err := validateEventKey(config); err != nil {
 			return nil, err
 		}
@@ -169,32 +180,35 @@ func validateEventKey(config ProviderConfig) error {
 	case header != "" && template != "":
 		return fmt.Errorf("%w: provider %q: event_key sets both header and template", ErrInvalidConfig, config.Name)
 	case template != "":
-		if _, err := compileTemplate(template); err != nil {
-			return fmt.Errorf("%w: provider %q: %v", ErrInvalidConfig, config.Name, err)
+		for _, alternative := range strings.Split(template, "|") {
+			if _, err := compileTemplate(strings.TrimSpace(alternative)); err != nil {
+				return fmt.Errorf("%w: provider %q: %v", ErrInvalidConfig, config.Name, err)
+			}
 		}
 	}
 	return nil
 }
 
-// validateAllowlistURL checks the dynamic allowlist source URL.
+// validateAllowlistURL checks the dynamic allowlist source URL: HTTPS only
+// (T-WH-08), so a poisoned plain-HTTP source cannot widen the allowlist.
 func validateAllowlistURL(config ProviderConfig) error {
 	raw := strings.TrimSpace(config.AllowlistURL)
 	if raw == "" {
 		return nil
 	}
 	parsed, err := url.Parse(raw)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
 		return fmt.Errorf("%w: provider %q: invalid ip_allowlist_url %q", ErrInvalidConfig, config.Name, raw)
 	}
 	return nil
 }
 
-// MissingAllowlist returns the names of providers with an empty ip_allowlist
-// in a stable order: the service warns about the fail-open dev mode.
+// MissingAllowlist returns the names of providers with no static and no dynamic
+// allowlist in a stable order: the service warns about the fail-open dev mode.
 func MissingAllowlist(providers map[string]ProviderConfig) []string {
 	names := make([]string, 0, len(providers))
 	for name, config := range providers {
-		if len(config.Allowlist) == 0 {
+		if len(config.Allowlist) == 0 && strings.TrimSpace(config.AllowlistURL) == "" {
 			names = append(names, name)
 		}
 	}
@@ -230,13 +244,36 @@ func parseAllowlistEntry(entry string) (netip.Prefix, error) {
 		if err != nil {
 			return netip.Prefix{}, fmt.Errorf("invalid allowlist entry %q", entry)
 		}
+		if err := validateUsablePrefix(normalized); err != nil {
+			return netip.Prefix{}, err
+		}
 		return normalized, nil
 	}
 	addr, err := netip.ParseAddr(entry)
 	if err != nil {
 		return netip.Prefix{}, fmt.Errorf("invalid allowlist entry %q", entry)
 	}
-	return netip.PrefixFrom(addr.Unmap(), addr.Unmap().BitLen()), nil
+	prefix := netip.PrefixFrom(addr.Unmap(), addr.Unmap().BitLen())
+	if err := validateUsablePrefix(prefix); err != nil {
+		return netip.Prefix{}, err
+	}
+	return prefix, nil
+}
+
+// validateUsablePrefix rejects entries that can never belong to a provider
+// endpoint: loopback, multicast and link-local addresses (a poisoned list must
+// not widen itself to internal networks). The unspecified form is rejected for
+// dynamic lists separately; static operator configuration keeps its explicit
+// 0.0.0.0/0 option.
+func validateUsablePrefix(prefix netip.Prefix) error {
+	addr := prefix.Addr()
+	switch {
+	case addr.IsLoopback():
+		return fmt.Errorf("loopback allowlist entry %q is forbidden", prefix)
+	case addr.IsMulticast(), addr.IsLinkLocalUnicast(), addr.IsLinkLocalMulticast():
+		return fmt.Errorf("link-local or multicast allowlist entry %q is forbidden", prefix)
+	}
+	return nil
 }
 
 // normalizePrefix converts an IPv4-mapped subnet to an IPv4 range

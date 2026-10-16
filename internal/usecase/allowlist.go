@@ -33,14 +33,21 @@ type AllowlistRefresher struct {
 }
 
 // NewAllowlistRefresher creates a refresher; a nil logger becomes a no-op.
+// The HTTP client rejects redirects: a redirected source could silently widen
+// the allowlist of a provider (T-WH-08).
 func NewAllowlistRefresher(sources map[string]string, target *domain.DynamicAllowlist, interval time.Duration, log *zap.Logger) *AllowlistRefresher {
 	if log == nil {
 		log = zap.NewNop()
 	}
 	return &AllowlistRefresher{
-		sources:  sources,
-		target:   target,
-		client:   &http.Client{Timeout: allowlistFetchTimeout},
+		sources: sources,
+		target:  target,
+		client: &http.Client{
+			Timeout: allowlistFetchTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 		interval: interval,
 		log:      log,
 	}
@@ -71,11 +78,10 @@ func (r *AllowlistRefresher) Refresh(ctx context.Context) error {
 	return firstErr
 }
 
-// Run refreshes immediately and then on every tick until the context is done.
+// Run refreshes on every tick until the context is done; the first load is
+// performed by the caller before the intake starts, so the service does not
+// serve requests in the fail-closed window (17.4).
 func (r *AllowlistRefresher) Run(ctx context.Context) {
-	if err := r.Refresh(ctx); err != nil {
-		r.log.Warn("initial dynamic allowlist refresh failed", zap.Error(err))
-	}
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
 	for {
@@ -105,9 +111,14 @@ func (r *AllowlistRefresher) fetch(ctx context.Context, url string) ([]netip.Pre
 	if response.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("usecase: allowlist source %s returned %d", url, response.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, maxAllowlistBodyBytes))
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxAllowlistBodyBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("usecase: read allowlist: %w", err)
+	}
+	if int64(len(body)) > maxAllowlistBodyBytes {
+		// A silently truncated list could replace the last known set with a
+		// partial one: an oversized response is an error instead.
+		return nil, fmt.Errorf("usecase: allowlist source %s exceeds %d bytes", url, maxAllowlistBodyBytes)
 	}
 	prefixes, err := domain.ParseAllowlistText(string(body))
 	if err != nil {

@@ -12,6 +12,12 @@ import (
 // ErrMissingEventKey reports a delivery without a resolvable vendor event key.
 var ErrMissingEventKey = errors.New("webhook-ingress: missing vendor event key")
 
+// maxVendorEventKeyLen bounds the vendor event key: it becomes a Kafka envelope
+// header and (for verified deliveries) feeds the deterministic event id, so an
+// unbounded provider-controlled value must never reach the outbox (a record
+// over the broker limit would stall the ordered relay).
+const maxVendorEventKeyLen = 128
+
 // keyPart is a compiled template segment: a literal or a dotted JSON path.
 type keyPart struct {
 	literal string
@@ -20,8 +26,10 @@ type keyPart struct {
 
 // VendorEventKey resolves the vendor event key of a delivery: the configured
 // header, a template over the JSON body, or the legacy event_id_header for
-// configurations without an event_key block. The key feeds the deterministic
-// event_id (CBL-5.1 FR-4a) and therefore must not be empty.
+// configurations without an event_key block. Alternative templates separated by
+// "|" are tried in order, which covers providers with several callback shapes
+// (for example CoinGate payments and refunds). The key feeds the deterministic
+// event_id (CBL-5.1 FR-4a) and therefore must not be empty or oversized.
 func (c ProviderConfig) VendorEventKey(header http.Header, body []byte) (string, error) {
 	headerName := strings.TrimSpace(c.EventIDHeader)
 	template := ""
@@ -39,26 +47,51 @@ func (c ProviderConfig) VendorEventKey(header http.Header, body []byte) (string,
 		if value == "" {
 			return "", fmt.Errorf("%w: header %q is empty", ErrMissingEventKey, headerName)
 		}
+		if len(value) > maxVendorEventKeyLen {
+			return "", fmt.Errorf("%w: header %q exceeds %d bytes", ErrMissingEventKey, headerName, maxVendorEventKeyLen)
+		}
 		return value, nil
 	}
 	if template == "" {
 		return "", fmt.Errorf("%w: provider %q has no event key source", ErrMissingEventKey, c.Name)
 	}
-	parts, err := compileTemplate(template)
-	if err != nil {
-		return "", err
-	}
 	parsed, err := decodeObject(body)
 	if err != nil {
 		return "", fmt.Errorf("%w: body: %v", ErrMissingEventKey, err)
 	}
+	var lastErr error
+	for _, alternative := range strings.Split(template, "|") {
+		parts, err := compileTemplate(strings.TrimSpace(alternative))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		key, err := renderKey(parts, parsed)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(key) > maxVendorEventKeyLen {
+			lastErr = fmt.Errorf("%w: resolved key exceeds %d bytes", ErrMissingEventKey, maxVendorEventKeyLen)
+			continue
+		}
+		return key, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("%w: template %q matched nothing", ErrMissingEventKey, template)
+	}
+	return "", lastErr
+}
+
+// renderKey resolves compiled parts against the decoded body.
+func renderKey(parts []keyPart, object map[string]any) (string, error) {
 	var builder strings.Builder
 	for _, part := range parts {
 		if part.literal != "" {
 			builder.WriteString(part.literal)
 			continue
 		}
-		value, err := lookupScalar(parsed, part.path)
+		value, err := lookupScalar(object, part.path)
 		if err != nil {
 			return "", err
 		}

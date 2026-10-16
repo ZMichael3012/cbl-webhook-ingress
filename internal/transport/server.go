@@ -28,6 +28,11 @@ import (
 // MaxBodyBytes sets the webhook body size limit (1 MB).
 const MaxBodyBytes int64 = 1 << 20
 
+// maxGatewayIDLen bounds the provider gateway id taken from the body: it
+// becomes part of the Kafka partition key, so an oversized value must never
+// reach the outbox.
+const maxGatewayIDLen = 128
+
 // Handler describes the webhook handler for the transport layer.
 type Handler interface {
 	Handle(ctx context.Context, in usecase.WebhookInput) (bool, error)
@@ -136,7 +141,7 @@ func (s *Server) handleWebhook(c *gin.Context) {
 	provider := c.Param("provider")
 	config, ok := s.providers[provider]
 	if !ok {
-		ginmw.AbortWithProblem(c, http.StatusNotFound, "provider_not_found", "Not Found", "провайдер не настроен")
+		ginmw.AbortWithProblem(c, http.StatusNotFound, "provider_not_found", "Not Found", "provider is not configured")
 		return
 	}
 	// Network checks are cheaper than reading the body and do not reveal
@@ -151,7 +156,7 @@ func (s *Server) handleWebhook(c *gin.Context) {
 	}
 	endpointID := c.Param("endpoint_id")
 	if len(config.Endpoints) > 0 && !slices.Contains(config.Endpoints, endpointID) {
-		ginmw.AbortWithProblem(c, http.StatusNotFound, "endpoint_not_found", "Not Found", "эндпоинт не зарегистрирован")
+		ginmw.AbortWithProblem(c, http.StatusNotFound, "endpoint_not_found", "Not Found", "endpoint is not registered")
 		return
 	}
 	if limiter := s.limiters[provider]; limiter != nil && !limiter.Allow(s.clock()) {
@@ -201,18 +206,35 @@ func (s *Server) handleWebhook(c *gin.Context) {
 	}
 	vendorEventID, keyErr := config.VendorEventKey(c.Request.Header, body)
 	if keyErr != nil {
-		if state == domain.VerifyVerified {
+		if config.StrategyName() != domain.StrategyTokenEcho {
 			ginmw.AbortWithProblem(c, http.StatusUnprocessableEntity, "missing_event_id", "Unprocessable Entity",
 				"vendor event id is required")
 			return
 		}
-		// An unverified recorded delivery without a resolvable key gets a random
-		// event id in the handler.
+		// Token echo must never answer 4xx (it disables CoinGate callbacks): an
+		// unresolvable key falls back to a random event id with a warning.
+		s.log.Warn("webhook vendor event key unresolved; a random event id is used",
+			zap.String("provider", provider),
+			zap.Error(keyErr),
+		)
 		vendorEventID = ""
 	}
 	// The token echo field is redacted after verification and before storage:
 	// the verification secret must never land in the outbox or Kafka (CF-4 hardening).
-	body = config.RedactToken(body)
+	// When the body cannot be rewritten safely it is not stored at all.
+	redactedBody, redactedOK := config.RedactToken(body)
+	if !redactedOK {
+		s.log.Error("token redaction failed; the raw body is not stored", zap.String("provider", provider))
+		redactedBody = nil
+	}
+	body = redactedBody
+	// An unbounded provider-controlled gateway id would become the Kafka
+	// partition key and can stall the ordered outbox relay: oversized ids are dropped.
+	gatewayID := extractGatewayID(body)
+	if len(gatewayID) > maxGatewayIDLen {
+		s.log.Warn("webhook gateway id dropped: over the length limit", zap.String("provider", provider))
+		gatewayID = ""
+	}
 
 	// The write budget protects the response from PostgreSQL degradation: the aborted
 	// transaction is rolled back, the provider retries the delivery, and there will be no duplicates.
@@ -224,7 +246,7 @@ func (s *Server) handleWebhook(c *gin.Context) {
 		VendorEventID:  vendorEventID,
 		Headers:        flattenHeaders(c.Request.Header, config.SignatureHeaderName()),
 		RawBody:        body,
-		GatewayID:      extractGatewayID(body),
+		GatewayID:      gatewayID,
 		SignatureState: state,
 		FetchRequired:  config.FetchRequired,
 	})
@@ -262,12 +284,15 @@ func (s *Server) handleWebhook(c *gin.Context) {
 }
 
 // allowedRemote checks the peer address against the static and the dynamic
-// provider allowlists: both empty keeps the dev fail-open mode, and when one
-// is configured the union of the two applies (17.4).
+// provider allowlists: no allowlist configured at all keeps the dev fail-open
+// mode; when a static list or a dynamic URL is configured the union applies,
+// and before the first successful dynamic load a URL-only provider stays
+// fail-closed (17.4).
 func (s *Server) allowedRemote(provider string, config domain.ProviderConfig, remoteAddr string) bool {
 	static := len(config.Allowlist) > 0
 	dynamic := s.dynamic != nil && s.dynamic.Size(provider) > 0
-	if !static && !dynamic {
+	configured := static || dynamic || strings.TrimSpace(config.AllowlistURL) != ""
+	if !configured {
 		return true
 	}
 	addr, ok := remoteIP(remoteAddr)

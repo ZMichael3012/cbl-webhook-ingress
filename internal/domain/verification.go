@@ -1,9 +1,11 @@
 package domain
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -55,13 +57,11 @@ func (c ProviderConfig) StrategyName() string {
 }
 
 // SignatureHeaderName returns the header carrying the signature; the token echo
-// strategy carries none.
+// strategy normally has none, but a configured header is still excluded from
+// the stored headers.
 func (c ProviderConfig) SignatureHeaderName() string {
 	if c.Verification == nil {
 		return c.SignatureHeader
-	}
-	if c.Verification.Strategy == StrategyTokenEcho {
-		return ""
 	}
 	return c.Verification.Header
 }
@@ -101,6 +101,12 @@ func (c ProviderConfig) verifier() (Verifier, error) {
 		return legacyVerifier{header: c.SignatureHeader}, nil
 	}
 	switch c.Verification.Strategy {
+	case StrategyLegacyHMAC:
+		header := strings.TrimSpace(c.SignatureHeader)
+		if header == "" {
+			return nil, fmt.Errorf("%w: provider %q: legacy_hmac requires signature_header", ErrInvalidConfig, c.Name)
+		}
+		return legacyVerifier{header: header}, nil
 	case StrategyRawHMAC:
 		header := strings.TrimSpace(c.Verification.Header)
 		if header == "" {
@@ -209,27 +215,33 @@ func parseEncoding(value string) (webhooksig.Encoding, error) {
 
 // RedactToken replaces the token echo field value with an empty string before
 // the raw event is recorded or published: the verification secret must never
-// land in the outbox, Kafka or logs. Bodies of other strategies pass unchanged
-// because they are signed over their exact bytes.
-func (c ProviderConfig) RedactToken(body []byte) []byte {
+// land in the outbox, Kafka or logs. ok=false means the body could not be
+// rewritten safely (malformed, non-object or having trailing data) and must not
+// be stored as is. Bodies of other strategies pass unchanged because they are
+// signed over their exact bytes.
+func (c ProviderConfig) RedactToken(body []byte) ([]byte, bool) {
 	if c.Verification == nil || c.Verification.Strategy != StrategyTokenEcho {
-		return body
+		return body, true
 	}
 	field := strings.TrimSpace(c.Verification.Field)
 	if field == "" {
 		field = "token"
 	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	var parsed map[string]json.RawMessage
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return body
+	if err := decoder.Decode(&parsed); err != nil || parsed == nil {
+		return nil, false
 	}
-	if _, ok := parsed[field]; !ok {
-		return body
+	// The verification decoder was strict; the redaction must not accept a body
+	// with trailing data that could smuggle a second token copy.
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, false
 	}
 	parsed[field] = json.RawMessage(`""`)
 	redacted, err := json.Marshal(parsed)
 	if err != nil {
-		return body
+		return nil, false
 	}
-	return redacted
+	return redacted, true
 }

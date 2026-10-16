@@ -2,6 +2,7 @@ package domain_test
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -35,7 +36,7 @@ func TestVendorEventKeyFromHeader(t *testing.T) {
 
 func TestVendorEventKeyFromTemplate(t *testing.T) {
 	t.Parallel()
-	config := keyConfig(t, `{"coingate":{"secret_env":"E","verification":{"strategy":"token_echo"},
+	config := keyConfig(t, `{"coingate":{"secret_env":"E","fetch_required":true,"verification":{"strategy":"token_echo"},
 		"event_key":{"template":"{id}:{status}"}}}`)
 
 	key, err := config.VendorEventKey(http.Header{}, []byte(`{"id":123,"status":"paid"}`))
@@ -62,6 +63,32 @@ func TestVendorEventKeyNestedTemplate(t *testing.T) {
 	key, err := config.VendorEventKey(http.Header{}, []byte(`{"data":{"id":"inv1","status":"paid"}}`))
 	require.NoError(t, err)
 	require.Equal(t, "inv1-paid", key)
+}
+
+func TestVendorEventKeyTemplateAlternatives(t *testing.T) {
+	t.Parallel()
+	config := keyConfig(t, `{"coingate":{"secret_env":"E","fetch_required":true,"verification":{"strategy":"token_echo"},
+		"event_key":{"template":"{refund_id}:{refund_status}|{id}:{status}"}}}`)
+
+	key, err := config.VendorEventKey(http.Header{}, []byte(`{"id":5,"status":"paid"}`))
+	require.NoError(t, err)
+	require.Equal(t, "5:paid", key)
+
+	key, err = config.VendorEventKey(http.Header{}, []byte(`{"refund_id":9,"refund_status":"refunded"}`))
+	require.NoError(t, err)
+	require.Equal(t, "9:refunded", key)
+
+	_, err = config.VendorEventKey(http.Header{}, []byte(`{"other":1}`))
+	require.ErrorIs(t, err, domain.ErrMissingEventKey)
+}
+
+func TestVendorEventKeyOversized(t *testing.T) {
+	t.Parallel()
+	config := keyConfig(t, `{"bitpay":{"secret_env":"E","verification":{"strategy":"raw_hmac","header":"X"},
+		"event_key":{"template":"{data.id}"}}}`)
+	long := strings.Repeat("a", 129)
+	_, err := config.VendorEventKey(http.Header{}, []byte(`{"data":{"id":"`+long+`"}}`))
+	require.ErrorIs(t, err, domain.ErrMissingEventKey)
 }
 
 func TestVendorEventKeyLegacyFallback(t *testing.T) {

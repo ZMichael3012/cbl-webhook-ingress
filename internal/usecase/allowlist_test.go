@@ -66,6 +66,28 @@ func TestAllowlistRefresherKeepsLastKnownOnError(t *testing.T) {
 	require.Equal(t, 1, target.Size("coingate"))
 }
 
+func TestAllowlistRefresherRejectsRedirect(t *testing.T) {
+	t.Parallel()
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("203.0.113.5"))
+	}))
+	defer target.Close()
+	redirecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer redirecting.Close()
+
+	dynamic := domain.NewDynamicAllowlist()
+	refresher := usecase.NewAllowlistRefresher(
+		map[string]string{"coingate": redirecting.URL},
+		dynamic,
+		time.Minute,
+		zap.NewNop(),
+	)
+	require.Error(t, refresher.Refresh(context.Background()))
+	require.Zero(t, dynamic.Size("coingate"))
+}
+
 func TestAllowlistRefresherContinuesOtherProviders(t *testing.T) {
 	t.Parallel()
 	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

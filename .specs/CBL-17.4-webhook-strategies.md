@@ -39,7 +39,10 @@ FR-1. Config (additive JSON of `WEBHOOK_PROVIDERS`, legacy compatible):
 - `ip_allowlist_url`: dynamic allowlist source (CoinGate ips-v4 list); merged with the
   static `ip_allowlist`; the enabled/disabled state follows the union of both.
 - Validation: strategy-specific required fields, unknown strategies, mutually exclusive
-  event key sources, malformed URLs are `ErrInvalidConfig`; secrets stay via `secret_env`.
+  event key sources, malformed URLs are `ErrInvalidConfig`; a provider with a `verification`
+  block but without any event key source (`event_key` or `event_id_header`) is rejected at
+  startup; `token_echo` requires `fetch_required` (its status model always needs the fetch);
+  secrets stay via `secret_env`.
 
 FR-2. Verification (domain, uses `webhooksig`):
 
@@ -55,7 +58,8 @@ FR-3. Response policies (CBL-003 section 4 hardening):
 - `raw_hmac`, `canonical_json_hmac`, `legacy_hmac`: verified -> 200 and record; any
   non-verified -> 401 and NOT recorded (the provider retries; no storage flooding).
 - `token_echo` (CoinGate): never 4xx/3xx for the hook route (a 4xx or redirect disables
-  callbacks): verified -> 200 and record; echo_mismatch/absent -> 200, the raw delivery
+  callbacks), including an unresolvable vendor key, which falls back to a random `event_id`
+  with a warning: verified -> 200 and record; echo_mismatch/absent -> 200, the raw delivery
   is recorded with the non-verified state for observability (random `event_id`, the
   deterministic dedup key of a genuine delivery is not poisoned) and a warning is logged;
   aggregating alerts are 17.18.
@@ -71,21 +75,28 @@ FR-4. Event metadata (CF-4):
   a random UUIDv7.
 
 FR-5. Dedup keys: `event_key.header` (BTCPay deliveryId) and `event_key.template`
-(NOWPayments `{payment_id}:{payment_status}`, CoinGate `{id}:{status}` + refund
-`{refund_id}:{refund_status}`, BitPay `{data.id}:{data.status}`); an unresolvable or empty
-key is 422 `missing_event_id`, as today for the legacy header.
+(NOWPayments `{payment_id}:{payment_status}`, CoinGate `{refund_id}:{refund_status}` or
+`{id}:{status}` as `|`-separated alternatives, BitPay `{data.id}:{data.status}`); an
+unresolvable or empty key is 422 `missing_event_id` for HMAC strategies (token echo keeps
+200 and uses a random id, see FR-3). The resolved key and the body-extracted gateway id are
+bounded to 128 bytes: an unbounded provider value in the Kafka key or envelope headers
+would stall the ordered outbox relay (poison pill).
 
-FR-6. Dynamic allowlist: a refresher fetches each `ip_allowlist_url` on a schedule
-(`WEBHOOK_ALLOWLIST_REFRESH`, default `10m`, 0 disables with a warning when URLs exist),
-parses newline/comma-separated IPs and CIDRs, atomically replaces the provider set; on a
-fetch or parse error the last known set is kept and a warning is logged; until the first
-successful load the static list (if any) applies; both empty stays the dev fail-open mode
-with the existing warning.
+FR-6. Dynamic allowlist: a refresher fetches each `ip_allowlist_url` (HTTPS only, redirects
+are not followed) on a schedule (`WEBHOOK_ALLOWLIST_REFRESH`, default `10m`, 0 disables;
+a configured URL with refreshes disabled is a startup error), parses newline/comma-separated
+IPs and CIDRs (catch-all and unspecified entries are rejected: a poisoned source must not
+widen itself to everything), atomically replaces the provider set; on a fetch, size or parse
+error the last known set is kept and a warning is logged; the first load runs before the
+intake starts, and a URL-configured provider stays fail-closed until the first successful
+load; a provider with neither a static list nor a URL stays the dev fail-open mode with the
+existing warning.
 
 FR-7. Token redaction: for `token_echo` the `field` value of the body is replaced with an
 empty string before the raw event is recorded or published (the verification secret never
-lands in the outbox, Kafka or logs); headers keep the existing sensitive filter minus the
-signature header of the provider.
+lands in the outbox, Kafka or logs); when the body cannot be rewritten safely (malformed,
+non-object, trailing data) the raw body is not stored at all and an error is logged; headers
+keep the existing sensitive filter minus the signature header of the provider.
 
 FR-8. Quality: unit tests for the strategy matrix, policies, event keys, redaction,
 allowlist parsing/merge/refresh; existing unit, integration and e2e scenarios stay green
@@ -102,3 +113,12 @@ Spec -> tests -> domain (verification, event key, allowlist) -> transport/usecas
 wiring -> battery (unit, integration, lint, emdash) -> commit
 `CBL-17.4: provider webhook strategies and policies` -> umbrella CBL-003 sync (unverified
 publication wording, §6 exception for the deterministic `event_id`).
+
+Review closure (4 reviewers, 16.10.2026): findings closed by the follow-up commit:
+bounded vendor keys and gateway ids (the outbox poison pill), token echo never answers 4xx
+(unresolvable key -> random event id, `|` template alternatives for payment and refund
+shapes), strict token redaction with a body-not-stored fallback, HTTPS-only refresh URLs
+without redirects, catch-all and unspecified entries rejected in dynamic lists, fail-closed
+intake before the first dynamic load (with a synchronous first refresh and a startup error
+on disabled refreshes), `token_echo` requiring `fetch_required`, English problem messages,
+spec/AGENTS/runbook sync.
