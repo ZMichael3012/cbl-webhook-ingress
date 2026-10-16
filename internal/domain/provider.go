@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"net/url"
 	"slices"
 	"strings"
 )
@@ -23,13 +24,41 @@ const (
 	MaxRateBurst = 1_000_000
 )
 
+// VerificationConfig describes the CF-4 provider webhook verification strategy.
+// When absent, the legacy fields (SignatureHeader, EventIDHeader) select the
+// legacy t/v1 scheme so existing providers keep working (17.4).
+type VerificationConfig struct {
+	// Strategy selects raw_hmac, canonical_json_hmac or token_echo.
+	Strategy string `json:"strategy"`
+	// Header sets the signature header; empty for token_echo.
+	Header string `json:"header"`
+	// Algorithm selects sha256 (default) or sha512.
+	Algorithm string `json:"algorithm"`
+	// Encoding selects hex (default) or base64.
+	Encoding string `json:"encoding"`
+	// Prefix is an optional digest prefix, for example "sha256=" of BTCPay.
+	Prefix string `json:"prefix"`
+	// Field sets the token echo body field; empty means "token".
+	Field string `json:"field"`
+}
+
+// EventKeyConfig describes the vendor event key source for deduplication:
+// exactly one of Header and Template is set (17.4).
+type EventKeyConfig struct {
+	// Header sets the header carrying the vendor event id.
+	Header string `json:"header"`
+	// Template sets a dotted-path template over the JSON body,
+	// for example "{data.id}:{data.status}".
+	Template string `json:"template"`
+}
+
 // ProviderConfig describes webhook intake settings of a single provider.
 type ProviderConfig struct {
 	// Name sets the provider name (configuration key).
 	Name string `json:"-"`
-	// SignatureHeader sets the signature header name.
+	// SignatureHeader sets the signature header name (legacy scheme).
 	SignatureHeader string `json:"signature_header"`
-	// EventIDHeader sets the event identifier header name.
+	// EventIDHeader sets the event identifier header name (legacy scheme).
 	EventIDHeader string `json:"event_id_header"`
 	// SecretEnv sets the name of the environment variable with the signing secret.
 	SecretEnv string `json:"secret_env"`
@@ -42,6 +71,15 @@ type ProviderConfig struct {
 	RateRPS int `json:"rate_rps"`
 	// RateBurst sets the rate limit burst capacity (0 - equal to RateRPS).
 	RateBurst int `json:"rate_burst"`
+	// Verification sets the CF-4 verification strategy; nil means the legacy scheme.
+	Verification *VerificationConfig `json:"verification"`
+	// FetchRequired asks the connector for a provider fetch before a canonical
+	// event (mandatory for CoinGate and BitPay status models, 17.4).
+	FetchRequired bool `json:"fetch_required"`
+	// EventKey sets the vendor event key source; nil means the legacy header.
+	EventKey *EventKeyConfig `json:"event_key"`
+	// AllowlistURL sets the dynamic allowlist source (CoinGate ips-v4 list).
+	AllowlistURL string `json:"ip_allowlist_url"`
 	// Secret sets the signing secret injected from the environment.
 	Secret []byte `json:"-"`
 	// Allowlist sets the parsed gateway subnets.
@@ -81,10 +119,12 @@ func ParseProviders(raw string, lookupEnv func(string) string) (map[string]Provi
 	providers := make(map[string]ProviderConfig, len(parsed))
 	for name, config := range parsed {
 		config.Name = name
-		if strings.TrimSpace(config.SignatureHeader) == "" ||
-			strings.TrimSpace(config.EventIDHeader) == "" ||
-			strings.TrimSpace(config.SecretEnv) == "" {
-			return nil, fmt.Errorf("%w: provider %q has empty fields", ErrInvalidConfig, name)
+		if strings.TrimSpace(config.SecretEnv) == "" {
+			return nil, fmt.Errorf("%w: provider %q has an empty secret_env", ErrInvalidConfig, name)
+		}
+		if config.Verification == nil &&
+			(strings.TrimSpace(config.SignatureHeader) == "" || strings.TrimSpace(config.EventIDHeader) == "") {
+			return nil, fmt.Errorf("%w: provider %q has empty legacy fields", ErrInvalidConfig, name)
 		}
 		secret := lookupEnv(config.SecretEnv)
 		if secret == "" {
@@ -102,9 +142,51 @@ func ParseProviders(raw string, lookupEnv func(string) string) (map[string]Provi
 		if config.RateRPS > 0 && config.RateBurst == 0 {
 			config.RateBurst = config.RateRPS
 		}
+		if _, err := config.verifier(); err != nil {
+			return nil, err
+		}
+		if err := validateEventKey(config); err != nil {
+			return nil, err
+		}
+		if err := validateAllowlistURL(config); err != nil {
+			return nil, err
+		}
 		providers[name] = config
 	}
 	return providers, nil
+}
+
+// validateEventKey checks the vendor event key configuration.
+func validateEventKey(config ProviderConfig) error {
+	if config.EventKey == nil {
+		return nil
+	}
+	header := strings.TrimSpace(config.EventKey.Header)
+	template := strings.TrimSpace(config.EventKey.Template)
+	switch {
+	case header == "" && template == "":
+		return fmt.Errorf("%w: provider %q: event_key is empty", ErrInvalidConfig, config.Name)
+	case header != "" && template != "":
+		return fmt.Errorf("%w: provider %q: event_key sets both header and template", ErrInvalidConfig, config.Name)
+	case template != "":
+		if _, err := compileTemplate(template); err != nil {
+			return fmt.Errorf("%w: provider %q: %v", ErrInvalidConfig, config.Name, err)
+		}
+	}
+	return nil
+}
+
+// validateAllowlistURL checks the dynamic allowlist source URL.
+func validateAllowlistURL(config ProviderConfig) error {
+	raw := strings.TrimSpace(config.AllowlistURL)
+	if raw == "" {
+		return nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return fmt.Errorf("%w: provider %q: invalid ip_allowlist_url %q", ErrInvalidConfig, config.Name, raw)
+	}
+	return nil
 }
 
 // MissingAllowlist returns the names of providers with an empty ip_allowlist
@@ -128,25 +210,33 @@ func parseAllowlist(raw []string) ([]netip.Prefix, error) {
 	}
 	prefixes := make([]netip.Prefix, 0, len(raw))
 	for _, entry := range raw {
-		entry = strings.TrimSpace(entry)
-		if entry == "" {
-			return nil, errors.New("empty allowlist entry")
-		}
-		if prefix, err := netip.ParsePrefix(entry); err == nil {
-			normalized, err := normalizePrefix(prefix)
-			if err != nil {
-				return nil, fmt.Errorf("invalid allowlist entry %q", entry)
-			}
-			prefixes = append(prefixes, normalized)
-			continue
-		}
-		addr, err := netip.ParseAddr(entry)
+		prefix, err := parseAllowlistEntry(entry)
 		if err != nil {
-			return nil, fmt.Errorf("invalid allowlist entry %q", entry)
+			return nil, err
 		}
-		prefixes = append(prefixes, netip.PrefixFrom(addr.Unmap(), addr.Unmap().BitLen()))
+		prefixes = append(prefixes, prefix)
 	}
 	return prefixes, nil
+}
+
+// parseAllowlistEntry parses one allowlist entry: a CIDR prefix or a single address.
+func parseAllowlistEntry(entry string) (netip.Prefix, error) {
+	entry = strings.TrimSpace(entry)
+	if entry == "" {
+		return netip.Prefix{}, errors.New("empty allowlist entry")
+	}
+	if prefix, err := netip.ParsePrefix(entry); err == nil {
+		normalized, err := normalizePrefix(prefix)
+		if err != nil {
+			return netip.Prefix{}, fmt.Errorf("invalid allowlist entry %q", entry)
+		}
+		return normalized, nil
+	}
+	addr, err := netip.ParseAddr(entry)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("invalid allowlist entry %q", entry)
+	}
+	return netip.PrefixFrom(addr.Unmap(), addr.Unmap().BitLen()), nil
 }
 
 // normalizePrefix converts an IPv4-mapped subnet to an IPv4 range

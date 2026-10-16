@@ -62,6 +62,16 @@ func main() {
 		log.Error("parse WEBHOOK_WRITE_TIMEOUT failed", zap.Error(err))
 		return
 	}
+	refreshInterval, err := domain.ParseAllowlistRefresh(os.Getenv("WEBHOOK_ALLOWLIST_REFRESH"))
+	if err != nil {
+		log.Error("parse WEBHOOK_ALLOWLIST_REFRESH failed", zap.Error(err))
+		return
+	}
+	dynamic := domain.NewDynamicAllowlist()
+	sources := allowlistSources(providers)
+	if len(sources) > 0 && refreshInterval == 0 {
+		log.Warn("dynamic allowlists are configured but WEBHOOK_ALLOWLIST_REFRESH is 0: refreshes disabled")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -89,8 +99,16 @@ func main() {
 		log.Warn("KAFKA_BROKERS is empty: outbox relay disabled, events stay pending")
 	}
 
+	if len(sources) > 0 && refreshInterval > 0 {
+		refresher := usecase.NewAllowlistRefresher(sources, dynamic, refreshInterval, log)
+		go refresher.Run(ctx)
+	}
+
 	handler := usecase.NewHandler(db, "cbl-webhook-ingress", log)
-	server := transport.NewServer(providers, handler, log, transport.WithWriteTimeout(writeTimeout))
+	server := transport.NewServer(providers, handler, log,
+		transport.WithWriteTimeout(writeTimeout),
+		transport.WithDynamicAllowlist(dynamic),
+	)
 
 	httpAddr := getenv("HTTP_ADDR", ":8060")
 	metricsAddr := getenv("METRICS_ADDR", ":9260")
@@ -147,6 +165,17 @@ func main() {
 		log.Error("metrics shutdown failed", zap.Error(shutdownErr))
 	}
 	log.Info("shutdown finished")
+}
+
+// allowlistSources collects the dynamic allowlist URLs per provider.
+func allowlistSources(providers map[string]domain.ProviderConfig) map[string]string {
+	sources := make(map[string]string)
+	for name, config := range providers {
+		if url := strings.TrimSpace(config.AllowlistURL); url != "" {
+			sources[name] = url
+		}
+	}
+	return sources
 }
 
 // metricsHandler serves the metrics placeholder until task 0.7.

@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -38,6 +37,7 @@ type Handler interface {
 type Server struct {
 	providers    map[string]domain.ProviderConfig
 	limiters     map[string]*domain.Limiter
+	dynamic      *domain.DynamicAllowlist
 	handler      Handler
 	clock        func() time.Time
 	window       time.Duration
@@ -48,6 +48,15 @@ type Server struct {
 
 // Option configures a Server.
 type Option func(*Server)
+
+// WithDynamicAllowlist sets the refreshed provider allowlist set.
+func WithDynamicAllowlist(dynamic *domain.DynamicAllowlist) Option {
+	return func(s *Server) {
+		if dynamic != nil {
+			s.dynamic = dynamic
+		}
+	}
+}
 
 // WithClock sets the time source for the replay window check.
 func WithClock(clock func() time.Time) Option {
@@ -132,16 +141,13 @@ func (s *Server) handleWebhook(c *gin.Context) {
 	}
 	// Network checks are cheaper than reading the body and do not reveal
 	// the existence of endpoint_id: a foreign address is rejected before all other checks.
-	if len(config.Allowlist) > 0 {
-		addr, ok := remoteIP(c.Request.RemoteAddr)
-		if !ok || !config.AllowsIP(addr) {
-			s.log.Warn("webhook source rejected",
-				zap.String("provider", provider),
-				zap.String("remote_addr", c.Request.RemoteAddr),
-			)
-			ginmw.AbortWithProblem(c, http.StatusForbidden, "ip_forbidden", "Forbidden", "")
-			return
-		}
+	if !s.allowedRemote(provider, config, c.Request.RemoteAddr) {
+		s.log.Warn("webhook source rejected",
+			zap.String("provider", provider),
+			zap.String("remote_addr", c.Request.RemoteAddr),
+		)
+		ginmw.AbortWithProblem(c, http.StatusForbidden, "ip_forbidden", "Forbidden", "")
+		return
 	}
 	endpointID := c.Param("endpoint_id")
 	if len(config.Endpoints) > 0 && !slices.Contains(config.Endpoints, endpointID) {
@@ -166,37 +172,61 @@ func (s *Server) handleWebhook(c *gin.Context) {
 		return
 	}
 
-	// The signature is verified before event headers are parsed: an unauthenticated
+	// Verification runs before event headers are parsed: an unauthenticated
 	// client must not receive distinguishable responses about the request structure.
-	signature := c.GetHeader(config.SignatureHeader)
-	if signature == "" {
-		ginmw.AbortWithProblem(c, http.StatusUnauthorized, "invalid_signature", "Unauthorized", "")
+	// The strategy and the response policy are per provider (CF-4, 17.4).
+	state, err := config.VerifyDelivery(c.Request.Header, body, s.clock(), s.window)
+	if err != nil {
+		s.log.Error("webhook verification configuration invalid", zap.String("provider", provider), zap.Error(err))
+		ginmw.AbortWithProblem(c, http.StatusInternalServerError, "internal_error", "Internal Server Error", "")
 		return
 	}
-	if err := hmac.Verify(config.Secret, signature, body, s.clock(), s.window); err != nil {
-		s.log.Warn("webhook signature rejected", zap.String("provider", provider), zap.Error(err))
-		ginmw.AbortWithProblem(c, http.StatusUnauthorized, "invalid_signature", "Unauthorized", "")
+	status, record := config.ResponsePolicy(state)
+	if !record {
+		s.log.Warn("webhook signature rejected",
+			zap.String("provider", provider),
+			zap.String("state", string(state)),
+		)
+		ginmw.AbortWithProblem(c, status, "invalid_signature", "Unauthorized", "")
 		return
 	}
-
-	vendorEventID := strings.TrimSpace(c.GetHeader(config.EventIDHeader))
-	if vendorEventID == "" {
-		ginmw.AbortWithProblem(c, http.StatusUnprocessableEntity, "missing_event_id", "Unprocessable Entity",
-			fmt.Sprintf("заголовок %s обязателен", config.EventIDHeader))
-		return
+	if state != domain.VerifyVerified {
+		// Token echo deliveries cannot be answered 4xx: the delivery is recorded
+		// with a non-verified state for observability and never yields a canonical
+		// event downstream (fail closed in the connector).
+		s.log.Warn("webhook verification failed but the delivery is recorded",
+			zap.String("provider", provider),
+			zap.String("state", string(state)),
+		)
 	}
+	vendorEventID, keyErr := config.VendorEventKey(c.Request.Header, body)
+	if keyErr != nil {
+		if state == domain.VerifyVerified {
+			ginmw.AbortWithProblem(c, http.StatusUnprocessableEntity, "missing_event_id", "Unprocessable Entity",
+				"vendor event id is required")
+			return
+		}
+		// An unverified recorded delivery without a resolvable key gets a random
+		// event id in the handler.
+		vendorEventID = ""
+	}
+	// The token echo field is redacted after verification and before storage:
+	// the verification secret must never land in the outbox or Kafka (CF-4 hardening).
+	body = config.RedactToken(body)
 
 	// The write budget protects the response from PostgreSQL degradation: the aborted
 	// transaction is rolled back, the provider retries the delivery, and there will be no duplicates.
 	writeCtx, cancel := context.WithTimeout(c.Request.Context(), s.writeTimeout)
 	defer cancel()
 	processed, err := s.handler.Handle(writeCtx, usecase.WebhookInput{
-		Provider:      provider,
-		EndpointID:    endpointID,
-		VendorEventID: vendorEventID,
-		Headers:       flattenHeaders(c.Request.Header, config.SignatureHeader),
-		RawBody:       body,
-		GatewayID:     extractGatewayID(body),
+		Provider:       provider,
+		EndpointID:     endpointID,
+		VendorEventID:  vendorEventID,
+		Headers:        flattenHeaders(c.Request.Header, config.SignatureHeaderName()),
+		RawBody:        body,
+		GatewayID:      extractGatewayID(body),
+		SignatureState: state,
+		FetchRequired:  config.FetchRequired,
 	})
 	if err != nil {
 		// Budget exhaustion arrives in two forms: waiting for a lock and
@@ -229,6 +259,25 @@ func (s *Server) handleWebhook(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "accepted", "duplicate": !processed})
+}
+
+// allowedRemote checks the peer address against the static and the dynamic
+// provider allowlists: both empty keeps the dev fail-open mode, and when one
+// is configured the union of the two applies (17.4).
+func (s *Server) allowedRemote(provider string, config domain.ProviderConfig, remoteAddr string) bool {
+	static := len(config.Allowlist) > 0
+	dynamic := s.dynamic != nil && s.dynamic.Size(provider) > 0
+	if !static && !dynamic {
+		return true
+	}
+	addr, ok := remoteIP(remoteAddr)
+	if !ok {
+		return false
+	}
+	if static && config.AllowsIP(addr) {
+		return true
+	}
+	return s.dynamic != nil && s.dynamic.Allows(provider, addr)
 }
 
 // remoteIP extracts the TCP peer address of the request; proxy headers are not read

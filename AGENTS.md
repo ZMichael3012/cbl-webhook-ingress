@@ -17,7 +17,8 @@ Out of scope: other platform services; interaction only through `cbl-protos` con
 
 - REST: POST /hooks/{provider}/{endpoint_id}
 - gRPC: none
-- Kafka produces: gateway.webhooks.raw
+- Kafka produces: gateway.webhooks.raw (CF-4 metadata: `signature_state`,
+  `fetch_required`, the deprecated `signature_verified` mirror)
 - Kafka consumes: none
 - Storage: PostgreSQL webhook_ingress
 
@@ -26,6 +27,10 @@ Contracts are frozen in `cbl-protos` (CF-1 for gRPC, CF-2/CF-3 for events), see 
 ## 3. Architecture
 
 Layers: `internal/transport` -> `internal/usecase` -> `internal/domain` -> `internal/storage`.
+Per-provider verification strategies (17.4): `legacy_hmac` (the platform t/v1 scheme,
+existing providers), `raw_hmac` (BTCPay, BitPay), `canonical_json_hmac` (NOWPayments),
+`token_echo` (CoinGate); the strategies come from the kit `webhooksig` package, the
+response policies and the dedup event keys are per provider (domain).
 Libraries: the standard set from `CBL-002` (Gin, GORM + pgx driver, franz-go + pkg/sr, go-redis,
 goose, zap). `AutoMigrate` is forbidden, migrations are goose-only, forward only.
 
@@ -49,7 +54,9 @@ E2E runs follow the `test/e2e/E2E.md` instruction (scenario E2E_WebhookIngress_K
 HTTP `8060`, gRPC `-`, metrics `9260`.
 Variables (applicable to the service): `HTTP_ADDR`, `GRPC_ADDR`, `METRICS_ADDR`, `PG_DSN`,
 `KAFKA_BROKERS`, `SCHEMA_REGISTRY_URL`, `REDIS_ADDR`, `WEBHOOK_WRITE_TIMEOUT`
-(event write budget, default `450ms`, allowed `100ms` - `5s`).
+(event write budget, default `450ms`, allowed `100ms` - `5s`),
+`WEBHOOK_ALLOWLIST_REFRESH` (dynamic provider allowlist refresh, default `10m`,
+`0` disables, clamped to `30s` - `24h`).
 
 ## 6. Development rules
 
@@ -77,6 +84,8 @@ consumer lag; dashboards after task 0.7.
 | T-WH-04 | Write budget `WEBHOOK_WRITE_TIMEOUT` (450 ms): when exceeded, the transaction is aborted, response `503` + `Retry-After: 1` | the response stays within the 500 ms budget under PostgreSQL degradation; the provider retries | provokes delivery retries under DB load | inbox idempotency excludes duplicates (5.2 FR-1); the threshold is verified by the 5.4 load test |
 | T-WH-05 | Gateway allowlist by TCP peer address (CIDR), proxy headers are not read | `X-Forwarded-For` spoofing does not bypass the protection; no dependency on the deployment scheme | behind a proxy/load balancer the peer address is the proxy address, the real gateway address is not distinguishable | the allowlist is filled with LB addresses; network restrictions - 0.3 (NetworkPolicy/firewall), transport-level access restriction - 0.6 (mTLS there is inter-service, the external gateway is separate); KI-webhook-ingress-04 |
 | T-WH-06 | Per-provider intake limit in-process (token bucket, no Redis) | the critical write path does not depend on Redis (T-02/T-11); zero overhead | with multiple replicas the limit is approximate (per-instance); the bucket resets on deploy; tokens are consumed before signature verification | aggregate protection is network-level (0.3: NetworkPolicy/firewall, LB limits); the 7.5 perimeter does not see webhooks; in prod the allowlist is mandatory (scanners will not exhaust the legitimate gateway bucket); revisit with multiple replicas |
+| T-WH-07 | Per-provider strategies and response policies (17.4): raw HMAC mismatches are `401` and dropped; token echo (CoinGate) always answers `200`/`204` and records unverified deliveries with a non-verified `signature_state` and a random `event_id` | callbacks of CoinGate are never disabled by a 4xx; attack attempts stay observable; only verified deliveries use the deterministic dedup key | unverified deliveries consume storage and intake tokens; the connector must fail closed (17.2) | the intake limit and the allowlist bound the volume; aggregated mismatch alerts - 17.18; the connector drops non-verified raws without canonical events |
+| T-WH-08 | Dynamic provider allowlist (17.4): fetched on a schedule and merged with the static list; a fetch failure keeps the last known set | CoinGate IP rotations do not need deploys; no fail-open after the first load | until the first successful load only the static list applies; a poisoned source could widen the set (TLS to the provider) | refreshes are read-only GETs over TLS to the provider domain; failures are logged and visible; the static list stays as the floor |
 
 ## 9. Known issues
 
@@ -96,6 +105,7 @@ consumer lag; dashboards after task 0.7.
 | CBL-5.3 | 2026-10-14 | done, review closed (peer IP allowlist, in-process intake limit, check order) | `.specs/CBL-5.3-protection.md` | 404c665 |
 | CBL-5.4 | 2026-10-14 | done, review closed (k6 burst/degraded profiles, p99 30.66 ms; os.ErrDeadlineExceeded classification fix; kafka-init on the stand) | `.specs/CBL-5.4-load.md` | 299002e |
 | CBL-16.11 | 2026-10-16 | done (English comments and documentation across the repository: code, tests, configs, all four specs, AGENTS.md, README; e2e runs via `test/e2e/E2E.md` with scenario E2E_WebhookIngress_Kafka; validation run PASS; coverage unchanged) | `.specs/CBL-16.11-conventions.md` | this commit |
+| CBL-17.4 | 2026-10-16 | done (per-provider verification strategies: legacy_hmac for existing providers, raw_hmac/canonical_json_hmac/token_echo for BTCPay/BitPay/NOWPayments/CoinGate over kit `webhooksig`; response policies (token echo always 200, unverified recorded with random event_id, HMAC 401 and dropped); CF-4 metadata `signature_state`/`fetch_required` with the deprecated mirror; provider dedup keys (header or `{a.b}` body template) and token redaction; dynamic allowlist refresher with last-known retention; unit coverage domain 91.6%, transport 86.8%, total 82.5%; integration and e2e green; lint 0 issues) | `.specs/CBL-17.4-webhook-strategies.md` | this commit |
 
 ## 11. Runbook
 
@@ -116,12 +126,23 @@ Webhook intake (5.2):
 
 Intake protection (5.3):
 
-1. `403 ip_forbidden` responses: the peer address is outside the provider `ip_allowlist`
-   (log `webhook source rejected` with `remote_addr`); on a legitimate gateway address
-   change update the allowlist; behind an LB remember that the peer address is the LB
-   address (KI-webhook-ingress-04).
+1. `403 ip_forbidden` responses: the peer address is outside the static and dynamic
+   provider allowlists (log `webhook source rejected` with `remote_addr`); on a legitimate
+   gateway address change update the allowlist; behind an LB remember that the peer
+   address is the LB address (KI-webhook-ingress-04).
 2. `429 rate_limited` responses (log `webhook rate limited`): a delivery burst exceeded
    `rate_rps`/`rate_burst`; check whether the provider duplicates events (duplicates are
    safe but consume tokens), and under sustained legitimate traffic raise the limit.
 3. Empty `ip_allowlist` for a provider: dev mode, any addresses are accepted; in prod
    fill it in (KI-webhook-ingress-04).
+
+Verification strategies (17.4):
+
+1. `invalid_signature` 401: an HMAC strategy rejected the delivery (log `webhook signature
+   rejected` with the state); check the provider secret in Vault and the strategy
+   configuration; the provider retries.
+2. Log `webhook verification failed but the delivery is recorded`: a token echo mismatch
+   or an absent token was recorded with a non-verified state; the connector never turns it
+   into a canonical event; a burst of such records indicates a wrong secret or an attack.
+3. Log `dynamic allowlist refresh failed`: the provider list URL is unreachable; the last
+   known set stays active; check egress and `WEBHOOK_ALLOWLIST_REFRESH`.

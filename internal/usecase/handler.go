@@ -18,6 +18,8 @@ import (
 
 	"github.com/cbl/cbl-kit/inbox"
 	"github.com/cbl/cbl-kit/outbox"
+
+	"github.com/cbl/cbl-webhook-ingress/internal/domain"
 )
 
 // TopicGatewayWebhooksRaw sets the topic of raw provider webhooks.
@@ -29,7 +31,8 @@ type WebhookInput struct {
 	Provider string
 	// EndpointID sets the endpoint identifier from the path.
 	EndpointID string
-	// VendorEventID sets the provider event identifier from the header.
+	// VendorEventID sets the provider event identifier; empty for unverified
+	// deliveries without a resolvable key (they get a random event id).
 	VendorEventID string
 	// Headers sets the request headers.
 	Headers map[string]string
@@ -37,6 +40,10 @@ type WebhookInput struct {
 	RawBody []byte
 	// GatewayID sets the provider payment identifier if it was extracted from the body.
 	GatewayID string
+	// SignatureState sets the CF-4 verification result of the delivery.
+	SignatureState domain.VerificationState
+	// FetchRequired asks the connector for a provider fetch before a canonical event.
+	FetchRequired bool
 }
 
 // Handler records webhooks in inbox and outbox.
@@ -67,7 +74,7 @@ func NewHandler(db *gorm.DB, producer string, log *zap.Logger) *Handler {
 // Handle stores the event; redelivery of the same event does not create a duplicate.
 // It returns processed=false if the event was already accepted earlier.
 func (h *Handler) Handle(ctx context.Context, in WebhookInput) (bool, error) {
-	eventID := uuid.NewSHA1(uuid.NameSpaceURL, []byte("cbl-webhook:"+in.Provider+":"+in.VendorEventID)).String()
+	eventID := h.eventID(in)
 	gatewayID := strings.TrimSpace(in.GatewayID)
 	// The partition key preserves per-entity ordering: when gateway_id is absent,
 	// endpoint_id is used and the envelope field stays unknown (CBL-5.1 FR-4).
@@ -76,13 +83,18 @@ func (h *Handler) Handle(ctx context.Context, in WebhookInput) (bool, error) {
 		gatewayID = "unknown"
 		partitionKey = in.Provider + ":" + in.EndpointID
 	}
+	verified := in.SignatureState == domain.VerifyVerified
 	raw := &eventsv1.GatewayWebhookRaw{
-		Provider:          in.Provider,
-		GatewayId:         gatewayID,
-		ReceivedAt:        timestamppb.New(h.clock().UTC()),
-		Headers:           in.Headers,
-		RawBody:           in.RawBody,
-		SignatureVerified: true,
+		Provider:   in.Provider,
+		GatewayId:  gatewayID,
+		ReceivedAt: timestamppb.New(h.clock().UTC()),
+		Headers:    in.Headers,
+		RawBody:    in.RawBody,
+		// SignatureVerified is the deprecated CF-4 mirror; signature_state is
+		// authoritative, and non-verified deliveries never yield canonical events.
+		SignatureVerified: verified, //nolint:staticcheck // SA1019: the mirror stays populated until the 17.4/17.2 cutover
+		SignatureState:    signatureStateProto(in.SignatureState),
+		FetchRequired:     in.FetchRequired,
 	}
 	payload, err := proto.Marshal(raw)
 	if err != nil {
@@ -114,4 +126,35 @@ func (h *Handler) Handle(ctx context.Context, in WebhookInput) (bool, error) {
 		)
 	}
 	return processed, nil
+}
+
+// eventID builds the envelope event id: verified deliveries use the
+// deterministic UUIDv5(provider + vendor key), so provider redeliveries dedupe
+// (CBL-5.1 FR-4a); unverified recorded deliveries get a random UUIDv7, so they
+// cannot poison the dedup slot of a genuine delivery (CF-4 hardening).
+func (h *Handler) eventID(in WebhookInput) string {
+	if in.SignatureState == domain.VerifyVerified && strings.TrimSpace(in.VendorEventID) != "" {
+		return uuid.NewSHA1(uuid.NameSpaceURL, []byte("cbl-webhook:"+in.Provider+":"+in.VendorEventID)).String()
+	}
+	random, err := uuid.NewV7()
+	if err != nil {
+		// NewV7 fails only when the system entropy source fails: fall back to a
+		// fully random id so the record is never dropped.
+		return uuid.NewString()
+	}
+	return random.String()
+}
+
+// signatureStateProto maps the domain verification state to the CF-4 enum.
+func signatureStateProto(state domain.VerificationState) eventsv1.WebhookSignatureState {
+	switch state {
+	case domain.VerifyVerified:
+		return eventsv1.WebhookSignatureState_WEBHOOK_SIGNATURE_STATE_VERIFIED
+	case domain.VerifyEchoMismatch:
+		return eventsv1.WebhookSignatureState_WEBHOOK_SIGNATURE_STATE_ECHO_MISMATCH
+	case domain.VerifyAbsent:
+		return eventsv1.WebhookSignatureState_WEBHOOK_SIGNATURE_STATE_ABSENT
+	default:
+		return eventsv1.WebhookSignatureState_WEBHOOK_SIGNATURE_STATE_HMAC_FAILED
+	}
 }
