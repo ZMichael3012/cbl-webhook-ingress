@@ -148,3 +148,28 @@ Verification strategies (17.4):
    into a canonical event; a burst of such records indicates a wrong secret or an attack.
 3. Log `dynamic allowlist refresh failed`: the provider list URL is unreachable; the last
    known set stays active; check egress and `WEBHOOK_ALLOWLIST_REFRESH`.
+
+## 12. Sandbox webhook testing (E17, 19.10.2026)
+
+- Secrets: the repository-root `.env` (gitignored) carries the
+  `WEBHOOK_PROVIDERS` JSON with the `nowpayments` (canonical_json_hmac),
+  `coingate` (token_echo, `fetch_required`) and `bitpay` (raw_hmac base64,
+  `fetch_required`) entries plus `NOWPAYMENTS_IPN_SECRET`, `COINGATE_IPN_TOKEN`
+  (our own generated echo secret, sent by the connector as the order token
+  after the KI-connector-14 fix) and `BITPAY_WEBHOOK_SECRET`.
+- Stand: `docker compose -p cbl-wh-now -f deploy/docker-compose.yml -f <override.yml> --profile app up -d --build --wait`;
+  the override file (kept outside the repository) replaces `WEBHOOK_PROVIDERS`
+  when the committed stand carries the mock provider only; the intake listens
+  on 8060.
+- Tunnel: the cloudflared quick tunnel to `http://localhost:8060` (commands in
+  the connector AGENTS.md section 12); the provider webhook URL is
+  `https://<host>/hooks/<provider>/<endpoint_id>`; an empty `endpoints` list
+  accepts any endpoint id; quick tunnel URLs are ephemeral.
+- CoinGate note: the dynamic allowlist refresh (`/v2/ips-v4`) and every other
+  call to CoinGate from this host need the local NL proxy (Cloudflare blocks
+  the stand IP); the dev stand leaves `ip_allowlist` empty (any address) and
+  omits the URL. In stage the refresh needs the same proxy path.
+- Verification checks: NOW `x-nowpayments-sig` (canonical JSON HMAC-SHA512),
+  CoinGate `token` echo, BitPay `x-signature` (base64 raw HMAC). A wrong secret
+  surfaces as `invalid_signature` (HMAC strategies) or an unverified record
+  (token echo, always 200).
