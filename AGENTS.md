@@ -173,3 +173,7 @@ Verification strategies (17.4):
   CoinGate `token` echo, BitPay `x-signature` (base64 raw HMAC). A wrong secret
   surfaces as `invalid_signature` (HMAC strategies) or an unverified record
   (token echo, always 200).
+- BitPay: the webhook entry is configured (raw_hmac base64, `fetch_required`),
+  but the BitPay webhook end-to-end run is POSTPONED together with the BitPay
+  acceptance (the account-side mock pay blocker, 030118; details in the
+  connector AGENTS.md section 12 and the umbrella 17.0 section 6.2).
