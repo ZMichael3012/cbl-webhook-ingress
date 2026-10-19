@@ -78,6 +78,9 @@ type ProviderConfig struct {
 	FetchRequired bool `json:"fetch_required"`
 	// EventKey sets the vendor event key source; nil means the legacy header.
 	EventKey *EventKeyConfig `json:"event_key"`
+	// GatewayID sets the provider payment identifier source; nil means the
+	// legacy top-level scan (17.26).
+	GatewayID *GatewayIDConfig `json:"gateway_id"`
 	// AllowlistURL sets the dynamic allowlist source (CoinGate ips-v4 list).
 	AllowlistURL string `json:"ip_allowlist_url"`
 	// Secret sets the signing secret injected from the environment.
@@ -159,6 +162,9 @@ func ParseProviders(raw string, lookupEnv func(string) string) (map[string]Provi
 		if err := validateEventKey(config); err != nil {
 			return nil, err
 		}
+		if err := validateGatewayID(config); err != nil {
+			return nil, err
+		}
 		if err := validateAllowlistURL(config); err != nil {
 			return nil, err
 		}
@@ -184,6 +190,25 @@ func validateEventKey(config ProviderConfig) error {
 			if _, err := compileTemplate(strings.TrimSpace(alternative)); err != nil {
 				return fmt.Errorf("%w: provider %q: %v", ErrInvalidConfig, config.Name, err)
 			}
+		}
+	}
+	return nil
+}
+
+// validateGatewayID checks the provider payment identifier configuration: a
+// present block must carry a compilable template, because a broken template
+// would silently send every delivery to the connector with "unknown" (17.26).
+func validateGatewayID(config ProviderConfig) error {
+	if config.GatewayID == nil {
+		return nil
+	}
+	template := strings.TrimSpace(config.GatewayID.Template)
+	if template == "" {
+		return fmt.Errorf("%w: provider %q: gateway_id is empty", ErrInvalidConfig, config.Name)
+	}
+	for _, alternative := range strings.Split(template, "|") {
+		if _, err := compileTemplate(strings.TrimSpace(alternative)); err != nil {
+			return fmt.Errorf("%w: provider %q: gateway_id template is invalid", ErrInvalidConfig, config.Name)
 		}
 	}
 	return nil

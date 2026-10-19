@@ -105,6 +105,93 @@ func TestHandleWebhookRawHMACRejectsMismatch(t *testing.T) {
 	require.Equal(t, "delivery-1", handler.lastInput.VendorEventID)
 }
 
+func TestHandleWebhookGatewayIDTemplate(t *testing.T) {
+	t.Parallel()
+	providers := parsedProviders(t, `{"nowpayments":{
+		"secret_env":"E",
+		"fetch_required":true,
+		"verification":{"strategy":"token_echo"},
+		"event_key":{"template":"{payment_id}:{payment_status}"},
+		"gateway_id":{"template":"{payment_id}"}
+	}}`)
+	handler := &fakeHandler{processed: true}
+	router := newTestRouterWithProviders(providers, handler)
+
+	body := `{"payment_id":"np-1","payment_status":"finished","token":"` + testSecret + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/hooks/nowpayments/ep1", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	require.Equal(t, "np-1", handler.lastInput.GatewayID,
+		"the configured template resolves the provider id the connector fetch needs")
+}
+
+func TestHandleWebhookGatewayIDLegacyNumeric(t *testing.T) {
+	t.Parallel()
+	providers := parsedProviders(t, `{"coingate":{
+		"secret_env":"E",
+		"fetch_required":true,
+		"verification":{"strategy":"token_echo"},
+		"event_key":{"template":"{id}:{status}"}
+	}}`)
+	handler := &fakeHandler{processed: true}
+	router := newTestRouterWithProviders(providers, handler)
+
+	body := `{"id":1042,"status":"paid","token":"` + testSecret + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/hooks/coingate/ep1", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	require.Equal(t, "1042", handler.lastInput.GatewayID,
+		"the real CoinGate callback carries a numeric id")
+}
+
+func TestHandleWebhookGatewayIDBitPayNested(t *testing.T) {
+	t.Parallel()
+	providers := parsedProviders(t, `{"bitpay":{
+		"secret_env":"E",
+		"fetch_required":true,
+		"verification":{"strategy":"token_echo"},
+		"event_key":{"template":"{data.id}:{data.status}"},
+		"gateway_id":{"template":"{data.id}"}
+	}}`)
+	handler := &fakeHandler{processed: true}
+	router := newTestRouterWithProviders(providers, handler)
+
+	body := `{"data":{"id":"inv-1","status":"complete"},"token":"` + testSecret + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/hooks/bitpay/ep1", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	require.Equal(t, "inv-1", handler.lastInput.GatewayID, "the nested BitPay invoice id resolves")
+}
+
+func TestHandleWebhookGatewayIDOversizedTemplateResultDropped(t *testing.T) {
+	t.Parallel()
+	providers := parsedProviders(t, `{"nowpayments":{
+		"secret_env":"E",
+		"fetch_required":true,
+		"verification":{"strategy":"token_echo"},
+		"event_key":{"template":"{payment_id}:{payment_status}"},
+		"gateway_id":{"template":"{payment_id}"}
+	}}`)
+	handler := &fakeHandler{processed: true}
+	router := newTestRouterWithProviders(providers, handler)
+
+	oversized := strings.Repeat("a", 129)
+	body := `{"payment_id":"` + oversized + `","payment_status":"finished","token":"` + testSecret + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/hooks/nowpayments/ep1", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	require.Equal(t, "", handler.lastInput.GatewayID,
+		"an oversized resolved id is dropped so the Kafka key stays bounded")
+}
+
 func TestHandleWebhookTokenEchoMissingKeyUsesRandomID(t *testing.T) {
 	t.Parallel()
 	providers := parsedProviders(t, `{"coingate":{

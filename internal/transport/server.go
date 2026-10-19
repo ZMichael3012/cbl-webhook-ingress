@@ -4,7 +4,6 @@ package transport
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -230,7 +229,7 @@ func (s *Server) handleWebhook(c *gin.Context) {
 	body = redactedBody
 	// An unbounded provider-controlled gateway id would become the Kafka
 	// partition key and can stall the ordered outbox relay: oversized ids are dropped.
-	gatewayID := extractGatewayID(body)
+	gatewayID := config.ExtractGatewayID(body)
 	if len(gatewayID) > maxGatewayIDLen {
 		s.log.Warn("webhook gateway id dropped: over the length limit", zap.String("provider", provider))
 		gatewayID = ""
@@ -346,23 +345,4 @@ func flattenHeaders(header http.Header, signatureHeader string) map[string]strin
 		headers[key] = values[0]
 	}
 	return headers
-}
-
-// extractGatewayID extracts gateway_id from the body without strict JSON parsing.
-func extractGatewayID(body []byte) string {
-	var parsed map[string]json.RawMessage
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return ""
-	}
-	for _, key := range []string{"gateway_id", "gatewayId", "id"} {
-		raw, ok := parsed[key]
-		if !ok {
-			continue
-		}
-		var value string
-		if err := json.Unmarshal(raw, &value); err == nil {
-			return value
-		}
-	}
-	return ""
 }
