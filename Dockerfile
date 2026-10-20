@@ -1,17 +1,17 @@
-# Build context: the services/ directory (needed for the replace directives to ../cbl-kit and ../cbl-protos).
-# Build: docker build -f cbl-webhook-ingress/Dockerfile -t cbl/webhook-ingress:dev .
+# Build context: the repository root (CBL-0.9). The cbl-kit and cbl-protos
+# modules are fetched from the GitHub origin; no sibling checkouts are needed.
 FROM golang:1.26-alpine AS build
+RUN apk add --no-cache git
+RUN git config --global url."https://github.com/ZMichael3012/".insteadOf "https://github.com/cbl/"
+ENV GOPRIVATE=github.com/cbl/*
 WORKDIR /src
-COPY cbl-kit/ /src/cbl-kit/
-COPY cbl-protos/ /src/cbl-protos/
-COPY cbl-webhook-ingress/ /src/cbl-webhook-ingress/
-WORKDIR /src/cbl-webhook-ingress
+COPY go.mod go.sum ./
 RUN go mod download
+COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/webhook-ingress ./cmd/webhook-ingress
-
 FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /app
 COPY --from=build /out/webhook-ingress /app/webhook-ingress
-COPY --from=build /src/cbl-webhook-ingress/migrations /app/migrations
+COPY --from=build /src/migrations /app/migrations
 EXPOSE 8060 9260
 ENTRYPOINT ["/app/webhook-ingress"]
