@@ -27,13 +27,13 @@ import (
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
-	eventsv1 "github.com/cbl/cbl-protos/gen/go/billing/events/v1"
+	eventsv1 "github.com/ZMichael3012/cbl-protos/gen/go/billing/events/v1"
 
-	"github.com/cbl/cbl-kit/ginmw"
-	"github.com/cbl/cbl-kit/hmac"
-	"github.com/cbl/cbl-kit/outbox"
-	"github.com/cbl/cbl-kit/outbox/kafkapub"
-	"github.com/cbl/cbl-kit/storagex"
+	"github.com/ZMichael3012/cbl-kit/ginmw"
+	"github.com/ZMichael3012/cbl-kit/hmac"
+	"github.com/ZMichael3012/cbl-kit/outbox"
+	"github.com/ZMichael3012/cbl-kit/outbox/kafkapub"
+	"github.com/ZMichael3012/cbl-kit/storagex"
 
 	"github.com/cbl/cbl-webhook-ingress/internal/domain"
 	"github.com/cbl/cbl-webhook-ingress/internal/transport"

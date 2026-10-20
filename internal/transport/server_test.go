@@ -17,8 +17,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
-	"github.com/cbl/cbl-kit/ginmw"
-	"github.com/cbl/cbl-kit/hmac"
+	"github.com/ZMichael3012/cbl-kit/ginmw"
+	"github.com/ZMichael3012/cbl-kit/hmac"
 
 	"github.com/cbl/cbl-webhook-ingress/internal/domain"
 	"github.com/cbl/cbl-webhook-ingress/internal/transport"

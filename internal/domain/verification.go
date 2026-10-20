@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cbl/cbl-kit/hmac"
-	"github.com/cbl/cbl-kit/webhooksig"
+	"github.com/ZMichael3012/cbl-kit/hmac"
+	"github.com/ZMichael3012/cbl-kit/webhooksig"
 )
 
 // VerificationState describes the result of a provider webhook verification (CF-4).
