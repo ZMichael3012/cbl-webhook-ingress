@@ -15,8 +15,8 @@ require (
 	github.com/twmb/franz-go/pkg/kadm v1.19.0
 	go.uber.org/zap v1.27.0
 	google.golang.org/protobuf v1.36.12
-	gorm.io/driver/postgres v1.5.11
-	gorm.io/gorm v1.25.12
+	gorm.io/driver/postgres v1.6.3
+	gorm.io/gorm v1.31.2
 )
 
 require (
